@@ -42,12 +42,17 @@ On first run, the application will:
 
 1. **Select Input File**: Click "Browse" in the "Input File" section to select an MKV file
 2. **Detect Audio**: Click "Detect Audio" to scan for audio streams in the file
-3. **Configure Output**:
-   - Output file path is auto-generated with `_AC3` suffix, but can be customized
-   - Select desired AC-3 bitrate (default: 384k)
-4. **Convert**: Click "Convert" to start the conversion
+3. **Configure conversion**:
+   - Choose the source audio track to convert
+   - Select the audio codec and bitrate
+   - Optionally remove the selected original track (off by default)
+4. **Convert**: Click "Convert" to append the converted track to the selected MKV
 5. The progress bar will show activity during conversion
 6. A success message will appear when complete
+
+The application writes a temporary MKV in the same folder and replaces the
+source file only after FFmpeg completes successfully. All existing streams are
+preserved by default; enabling removal omits only the selected original audio track.
 
 ## File Structure
 
@@ -86,14 +91,13 @@ The application uses FFmpeg's probe functionality to scan the input file and ext
 
 FFmpeg command used:
 ```
-ffmpeg -i input.mkv -c:v copy -c:a ac3 -b:a [bitrate] output.mkv -y
+ffmpeg -i input.mkv -map 0 -map 0:[selected-stream] -c copy \
+  -c:a:[new-track] ac3 -b:a:[new-track] [bitrate] temporary.mkv -y
 ```
 
 This approach:
-- Copies video stream unchanged (no re-encoding)
-- Encodes audio to AC-3/Dolby Digital
-- Preserves MKV container format
-- Automatically overwrites output file if it exists
+- Copies all existing streams, then appends the selected source track as AC-3/Dolby Digital
+- Replaces the source MKV only after the temporary conversion succeeds
 
 ## Troubleshooting
 

@@ -5,11 +5,11 @@ import threading
 from pathlib import Path
 from tkinter import (
     Tk, Frame, Label, Entry, Button, Text, messagebox,
-    filedialog, Scrollbar, StringVar, ttk, LabelFrame, END, BOTH
+    filedialog, Scrollbar, StringVar, BooleanVar, Checkbutton, ttk, LabelFrame, END, BOTH
 )
 
 from ffmpeg_downloader import ensure_ffmpeg_available
-from ffmpeg_helper import get_audio_streams, convert_to_ac3
+from ffmpeg_helper import get_audio_streams, convert_and_append_audio
 
 
 class ConverterApp:
@@ -18,7 +18,7 @@ class ConverterApp:
     def __init__(self, root):
         self.root = root
         self.root.title("DTS to AC-3 Converter")
-        self.root.geometry("800x900")
+        self.root.geometry("800x820")
         self.ffmpeg_path = None
         self.current_file = None
         self.audio_streams = []
@@ -105,21 +105,22 @@ class ConverterApp:
         self.audio_text.pack(fill=BOTH, expand=True)
         scrollbar.config(command=self.audio_text.yview)
 
-        # Output settings frame
-        output_frame = LabelFrame(main_frame, text="Output Settings", padx=10, pady=10)
+        # Conversion settings frame
+        output_frame = LabelFrame(main_frame, text="Conversion Settings", padx=10, pady=10)
         output_frame.pack(fill="x", pady=(0, 10))
 
-        Label(output_frame, text="Output File:").grid(row=0, column=0, sticky="w")
-        self.output_entry = Entry(output_frame, width=50)
-        self.output_entry.grid(row=0, column=1, padx=5)
-
-        Button(
-            output_frame, text="Browse",
-            command=self._select_output
-        ).grid(row=0, column=2)
+        Label(output_frame, text="Convert audio track:").grid(row=0, column=0, sticky="w")
+        self.track_var = StringVar()
+        self.track_combo = ttk.Combobox(
+            output_frame,
+            textvariable=self.track_var,
+            state="disabled",
+            width=50,
+        )
+        self.track_combo.grid(row=0, column=1, sticky="w", padx=5)
 
         Label(output_frame, text="Audio Codec:").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        self.codec_var = StringVar(value="ac3")
+        self.codec_var = StringVar(value="AC-3 (Dolby Digital)")
         codec_combo = ttk.Combobox(
             output_frame,
             textvariable=self.codec_var,
@@ -140,6 +141,20 @@ class ConverterApp:
         )
         self.bitrate_combo.grid(row=2, column=1, sticky="w", padx=5, pady=(10, 0))
         self._update_bitrate_options()
+
+        self.remove_source_var = BooleanVar(value=False)
+        self.remove_source_check = Checkbutton(
+            output_frame,
+            text="Remove the original selected audio track after conversion",
+            variable=self.remove_source_var,
+            command=self._warn_about_removal,
+        )
+        self.remove_source_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        Label(
+            output_frame,
+            text="The original MKV will be updated in place. All other streams are preserved.",
+            fg="#555555",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         # Progress bar
         self.progress = ttk.Progressbar(main_frame, mode="indeterminate")
@@ -182,32 +197,10 @@ class ConverterApp:
             self.file_entry.delete(0, END)
             self.file_entry.insert(0, file_path)
 
-            # Generate default output path
-            output_path = self._generate_output_path(file_path)
-            self.output_entry.delete(0, END)
-            self.output_entry.insert(0, output_path)
-
             # Log and auto-detect audio
             filename = Path(file_path).name
             self._log(f"File selected: {filename}")
             self._detect_audio()
-
-    def _select_output(self):
-        """Open file dialog to select output file."""
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".mkv",
-            filetypes=[("MKV files", "*.mkv"), ("All files", "*.*")]
-        )
-        if file_path:
-            self.output_entry.delete(0, END)
-            self.output_entry.insert(0, file_path)
-
-    def _generate_output_path(self, input_path: str) -> str:
-        """Generate default output path with codec suffix."""
-        path = Path(input_path)
-        codec = self.codec_var.get()
-        suffix = "_AC3" if "AC-3" in codec else "_DDPLUS"
-        return str(path.parent / f"{path.stem}{suffix}.mkv")
 
     def _update_bitrate_options(self):
         """Update available bitrates based on selected codec."""
@@ -262,9 +255,13 @@ class ConverterApp:
         if streams:
             for stream in streams:
                 self.audio_text.insert(END, f"{str(stream)}\n")
+            self.track_combo.config(values=[str(stream) for stream in streams], state="readonly")
+            self.track_combo.current(0)
             self.convert_button.config(state="normal")
         else:
             self.audio_text.insert(END, "No audio streams found")
+            self.track_combo.config(values=(), state="disabled")
+            self.track_var.set("")
         self.audio_text.config(state="disabled")
 
     def _update_audio_display_error(self, error_msg):
@@ -273,14 +270,26 @@ class ConverterApp:
         self.audio_text.delete(1.0, END)
         self.audio_text.insert(END, f"Error: {error_msg}")
         self.audio_text.config(state="disabled")
+        self.track_combo.config(values=(), state="disabled")
+        self.track_var.set("")
+
+    def _warn_about_removal(self):
+        """Explain the consequence of removing the source audio track."""
+        if self.remove_source_var.get():
+            messagebox.showwarning(
+                "Original track will be removed",
+                "The selected original audio track will be removed from the updated MKV "
+                "after its converted replacement is added.\n\n"
+                "The app writes a temporary file first, but once conversion succeeds the "
+                "source MKV is replaced. Keep this option off to retain the original track."
+            )
 
     def _start_conversion(self):
         """Start the conversion process."""
         input_path = self.file_entry.get()
-        output_path = self.output_entry.get()
 
-        if not input_path or not output_path:
-            messagebox.showwarning("Warning", "Please select input and output files")
+        if not input_path:
+            messagebox.showwarning("Warning", "Please select an MKV file")
             return
 
         if not self.ffmpeg_path:
@@ -292,38 +301,50 @@ class ConverterApp:
             messagebox.showerror("Error", f"Input file not found: {input_path}")
             return
 
-        # Check output directory exists
-        output_dir = os.path.dirname(output_path)
-        if output_dir and not os.path.exists(output_dir):
-            messagebox.showerror("Error", f"Output directory not found: {output_dir}")
+        selected_track = self.track_combo.current()
+        if selected_track < 0 or selected_track >= len(self.audio_streams):
+            messagebox.showwarning("Warning", "Choose an audio track to convert")
             return
 
         bitrate = self.bitrate_var.get()
         codec_choice = self.codec_var.get()
         codec = "eac3" if "E-AC-3" in codec_choice else "ac3"
+        source_stream = self.audio_streams[selected_track]
+        remove_source = self.remove_source_var.get()
+
+        action = "replace the selected original audio track" if remove_source else "keep the selected original audio track and append a converted copy"
+        if not messagebox.askyesno(
+            "Update source MKV",
+            f"This will update the selected MKV in place. It will {action}.\n\n"
+            "A temporary MKV is created first and replaces the source only after success. "
+            "This cannot be undone. Continue?"
+        ):
+            return
 
         self.convert_button.config(state="disabled")
         self.progress.start()
 
         input_file = Path(input_path).name
-        output_file = Path(output_path).name
         self._log(f"========================================")
         self._log(f"Starting conversion")
         self._log(f"  Input: {input_file}")
-        self._log(f"  Output: {output_file}")
+        self._log(f"  Selected track: {source_stream}")
         self._log(f"  Codec: {codec_choice}")
         self._log(f"  Bitrate: {bitrate}")
+        self._log(f"  Remove original: {'Yes' if remove_source else 'No'}")
         self._log(f"  Status: Processing...")
         self._log(f"========================================")
 
         def convert():
             try:
-                result = convert_to_ac3(
+                result = convert_and_append_audio(
                     input_path,
-                    output_path,
                     bitrate,
                     self.ffmpeg_path,
+                    source_stream.stream_index,
+                    len(self.audio_streams),
                     codec=codec,
+                    remove_source_stream=remove_source,
                     progress_callback=self._log
                 )
 
@@ -333,11 +354,11 @@ class ConverterApp:
                 if result:
                     self._log(f"========================================")
                     self._log("✓ Conversion completed successfully!")
-                    self._log(f"  Output: {output_file}")
+                    self._log(f"  Updated: {input_file}")
                     self._log(f"========================================")
                     messagebox.showinfo(
                         "Success",
-                        f"Conversion completed successfully!\n\n{output_path}"
+                        f"Conversion completed successfully.\n\nUpdated MKV:\n{input_path}"
                     )
                 else:
                     self._log("✗ Conversion failed")
