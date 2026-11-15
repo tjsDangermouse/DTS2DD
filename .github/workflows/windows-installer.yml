@@ -38,18 +38,20 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: vendor/librempeg
-          key: librempeg-win64-${{ env.LIBREMPEG_COMMIT }}-${{ hashFiles('installer/patches/*.patch') }}-zlib-v2
+          key: librempeg-win64-${{ env.LIBREMPEG_COMMIT }}-${{ hashFiles('installer/patches/*.patch') }}-zlib-ucrt-v3
 
       - name: Set up MSYS2
         if: steps.librempeg-cache.outputs.cache-hit != 'true'
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          # UCRT64: MSYS2 has deprecated the MINGW64 environment. The resulting
+          # static exe only needs the Universal C Runtime built into Windows 10/11.
+          msystem: UCRT64
           update: true
           install: >-
             git make diffutils
-            mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-zlib
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-zlib
 
       - name: Build LibreMPEG
         if: steps.librempeg-cache.outputs.cache-hit != 'true'
@@ -69,7 +71,7 @@ jobs:
                       --extra-ldflags=-static --pkg-config-flags=--static
           make -j"$(nproc)"
           # Must run on a clean PC: no MinGW/MSYS2 DLL dependencies allowed
-          if ldd ffmpeg.exe ffprobe.exe | grep -i -E "mingw64|msys"; then
+          if ldd ffmpeg.exe ffprobe.exe | grep -i -E "ucrt64|mingw64|clang64|msys"; then
             echo "LibreMPEG has MinGW DLL dependencies"; exit 1
           fi
           ./ffmpeg.exe -hide_banner -h encoder=truehd | tee ../truehd-encoder.txt
@@ -88,7 +90,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: vendor/librempeg
-          key: librempeg-win64-${{ env.LIBREMPEG_COMMIT }}-${{ hashFiles('installer/patches/*.patch') }}-zlib-v2
+          key: librempeg-win64-${{ env.LIBREMPEG_COMMIT }}-${{ hashFiles('installer/patches/*.patch') }}-zlib-ucrt-v3
 
       # ------------------------------------------------------------------- FFmpeg
       - name: Download FFmpeg (checksum verified)

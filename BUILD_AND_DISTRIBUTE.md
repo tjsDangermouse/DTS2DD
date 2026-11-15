@@ -252,10 +252,10 @@ Not yet built and tested on Windows by the developer of this change; the same
 configuration was built and tested on macOS. After building, the app's
 self-test decides whether the binary is usable.
 
-1. Install MSYS2 (https://www.msys2.org/) and open the **MSYS2 MINGW64** shell.
+1. Install MSYS2 (https://www.msys2.org/) and open the **MSYS2 UCRT64** shell (MINGW64 is deprecated).
 2. Install tools:
    ```bash
-   pacman -S --needed git make diffutils mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zlib
+   pacman -S --needed git make diffutils mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-zlib
    ```
 3. Build (pinning the verified commit):
    ```bash
