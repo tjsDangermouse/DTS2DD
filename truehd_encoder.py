@@ -656,7 +656,7 @@ def check_encoder(
     elif missing:
         report.status = STATUS_NOT_VERIFIED
         report.message = ("This LibreMPEG build cannot be used: " + "; ".join(missing)
-                          + ". Use the LibreMPEG included with DTS2DD 1.1.2 or later.")
+                          + ". Use the LibreMPEG included with DTS2DD 1.1.3 or later.")
     else:
         report.status = STATUS_NOT_VERIFIED
         report.message = f"7.1 self-test failed: {first_failure('7.1')}"

@@ -288,13 +288,13 @@ Denon is **unverified**.
   proper downmixes: a 5.1-only decoder would not hear the rear surrounds.
   7.1-capable receivers such as the AVR-X1800H decode the full 8-channel
   presentation.
-- Known encoder issue handled by the app (fixed in 1.1.2): LibreMPEG declared
+- Known encoder issue handled by the app (fixed in 1.1.3): LibreMPEG declared
   a 9.6 Mb/s peak data rate that loud passages exceed, so AV receivers could
   glitch briefly (Spectre at 0:34). The included LibreMPEG is patched to
   declare 18 Mb/s, and every conversion checks that the stream stays within
   it. Files converted with 1.1.0 / 1.1.1 should be converted again - their
   copied subtitles may also be corrupted (the earlier LibreMPEG build lacked
-  zlib); 1.1.2 compares every copied track with the original.
+  zlib); 1.1.3 compares every copied track with the original.
 - Known encoder issue handled by the app: LibreMPEG marks the last few
   samples (under 1 ms) of the stream as padding, which would make players drop
   real audio at the very end. The app removes that marker and verifies every
