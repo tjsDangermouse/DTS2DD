@@ -26,6 +26,7 @@ from media_probe import (
 from truehd_encoder import (
     LAYOUT_LABELS, LOSSLESS_SAMPLE_FORMATS, SAMPLE_RATES_BY_CHANNELS, SUPPORTED_LAYOUTS,
     EncoderReport, TrueHDError, TrueHDJob, build_clip_cut_command, build_output_decode_command,
+    may_exceed_peak_rate,
     build_output_hash_command, build_source_decode_command, build_truehd_command,
     check_access_unit_sizes, check_channel_assignment, read_hash_file, read_major_sync,
 )
@@ -97,6 +98,13 @@ def source_warnings(stream: AudioStreamInfo) -> List[str]:
     if stream.profile and "DTS:X" in stream.profile:
         warnings.append("DTS:X object metadata cannot be carried into TrueHD; the lossless "
                         "7.1/5.1 channel bed is converted. The result is NOT Dolby Atmos.")
+    if (stream.channel_count and stream.sample_rate
+            and may_exceed_peak_rate(stream.channel_count, stream.sample_rate, stream.bit_depth or 24)):
+        warnings.append(
+            f"{stream.channel_count}-channel {stream.sample_rate // 1000} kHz audio is close to "
+            "TrueHD's 18 Mb/s maximum. Loud passages may not fit, in which case the conversion "
+            "stops at the end with an error and no file is saved. Try a test clip of a loud "
+            "scene first.")
     return warnings
 
 

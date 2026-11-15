@@ -141,6 +141,21 @@ class SourceValidationTests(unittest.TestCase):
         problems = tw.validate_source(dts_stream(rate=192000), report_with(["7.1"]))
         self.assertTrue(any("not a valid Dolby TrueHD configuration" in p for p in problems))
 
+    def test_high_sample_rate_peak_warning(self):
+        """Warn only where even incompressible audio could exceed 1875-byte access units."""
+        cases = [
+            (8, 48000, 24, False), (6, 48000, 24, False), (6, 96000, 24, False),
+            (8, 96000, 24, True), (6, 192000, 24, True), (8, 88200, 24, True),
+            (8, 96000, 16, False), (8, 44100, 24, False),
+        ]
+        for channels, rate, bits, expect in cases:
+            self.assertEqual(te.may_exceed_peak_rate(channels, rate, bits), expect, (channels, rate, bits))
+        warn = tw.source_warnings(dts_stream("7.1", 8, rate=96000))
+        self.assertTrue(any("18 Mb/s maximum" in w for w in warn))
+        self.assertFalse(any("18 Mb/s" in w for w in tw.source_warnings(dts_stream())))
+        # It is a warning, not a block: validation still allows 7.1/96k
+        self.assertEqual(tw.validate_source(dts_stream("7.1", 8, rate=96000), report_with(["7.1"])), [])
+
     def test_dtsx_allowed_with_warning(self):
         stream = dts_stream(profile="DTS-HD MA + DTS:X")
         self.assertEqual(tw.validate_source(stream, report_with(["7.1"])), [])

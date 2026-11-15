@@ -245,6 +245,197 @@ DTS2DD/
 - Drag-and-drop file selection
 - Code-signed installer (removes the SmartScreen warning)
 
+## Notes: TrueHD glitch and damaged subtitles (fixed in 1.1.3)
+
+### Summary
+
+Spectre (2015), converted to Dolby TrueHD 7.1 and played through Plex on a
+Fire TV Stick 4K Plus to a Denon AVR-X1800H, had a short audible glitch about
+34 seconds in. The same file played cleanly in VLC.
+
+The cause was a header value in the TrueHD stream. LibreMPEG's encoder
+declared a maximum data rate of 9.6 Mb/s, and the loudest passage so far in
+the film briefly needed slightly more. The Denon's hardware decoder enforces
+that declared limit; software decoders such as VLC ignore it.
+
+Version 1.1.3 declares 18 Mb/s (the TrueHD maximum) and checks every
+converted file against the declared limit. A 1.1.3 test clip played on the
+Fire TV and Denon without the glitch.
+
+The investigation also found a second, unrelated bug: subtitles, and one video
+packet, were damaged in files converted with 1.1.0 and 1.1.1. That is also
+fixed in 1.1.3. **Files converted with 1.1.0 or 1.1.1 should be converted
+again.**
+
+### Symptom
+
+| Observation | Meaning |
+|---|---|
+| Glitch at about 0:34-0:35 via Fire TV -> Denon | The problem shows up on the hardware path |
+| No glitch when the converted TrueHD track plays in VLC | The decoded audio is perfect |
+| No glitch in the original DTS-HD track (another device, and VLC) | The source is fine |
+| Strict lossless verification passed | The TrueHD audio exactly matched the source |
+
+Every sample was correct, so the problem had to be in how the stream
+*describes* itself to a hardware decoder.
+
+### How TrueHD audio is delivered
+
+- **Access units:** TrueHD audio is split into small chunks called *access
+  units*. At 48 kHz each holds 40 samples (0.83 ms), so there are 1,200 per
+  second.
+- **Headers:** every 16 access units the stream repeats a header. One of its
+  fields is the **peak data rate**, the fastest the stream promises to need
+  data.
+- **Input timing:** each access unit also carries an *input timing* value,
+  which tells the decoder when its data should arrive.
+- **What Dolby's encoder does:** it varies the input timing, so a large access
+  unit can start arriving early.
+- **What LibreMPEG does:** it always writes the same input timing. Each access
+  unit therefore has to arrive within its own 0.83 ms, at no more than the
+  declared peak rate.
+- **The result:** with a declared 9.6 Mb/s, no access unit may exceed
+  **1,000 bytes** (9.6 Mb/s x 0.83 ms / 8).
+
+A hardware decoder that trusts the header briefly runs short of data when an
+access unit is larger, which is heard as a dropout or click. FFmpeg's decoder,
+used by VLC and by the app's checks, ignores the header value.
+
+### Evidence
+
+Real Dolby streams versus LibreMPEG's (from genuine Dolby TrueHD samples in
+FFmpeg's official test files):
+
+| | Real Dolby 7.1 | Real Dolby 5.1 | LibreMPEG (before fix) |
+|---|---|---|---|
+| Declared peak rate | 7.66 Mb/s (set from the content) | 3.15 Mb/s (set from the content) | **Always 9.60 Mb/s** |
+| Input timing between access units | Varies (39, 40, 57) | Varies (35, 40, 45) | **Always 40** |
+| Extra header fields (dialogue level etc.) | Filled in | Filled in | All zero |
+
+Spectre's first minute, encoded exactly as the app did:
+
+| Time | Average rate | Loudest front channel | Largest access unit |
+|---|---|---|---|
+| 0:28-0:32 | 4.6-5.2 Mb/s | -14 to -21 dBFS | 7.8-8.2 Mb/s |
+| **0:34** | **6.75 Mb/s** | **-4 dBFS** | **9.8 Mb/s** |
+| 0:35-0:37 | 6.3-6.7 Mb/s | -3 to -6 dBFS | 9.5-9.6 Mb/s |
+
+At 0:34 the soundtrack becomes louder than anything before it. Only 9 of the
+72,000 access units in the first minute reached the 1,000-byte limit: seven
+between **0:34.467 and 0:34.653** (largest 1,018 bytes), where the glitch was
+heard, and two at about 0:44.8.
+
+Ruled out:
+- **DTS decoding:** no decoder errors or fallback to the lossy core, and the
+  audio fingerprints matched.
+- **Channels:** all eight carry sound from the start.
+- **Stream integrity:** TrueHD's own integrity and lossless checks pass.
+- **Overall data rate:** the busiest 13 ms window (7.15 Mb/s) is under
+  9.6 Mb/s. Only individual access units exceed the limit, which is why the
+  constant input timing matters.
+
+### Why the app's checks didn't catch it
+
+- Strict verification compares decoded audio, which was perfect.
+- FFmpeg's TrueHD decoder ignores the declared peak rate.
+- The self-test used half a second of moderate-volume test audio.
+- The trigger depends on content: only loud, dense passages hit it.
+
+### The fix
+
+1. A LibreMPEG patch
+   ([installer/patches/librempeg-truehd-peak-bitrate.patch](installer/patches/librempeg-truehd-peak-bitrate.patch))
+   adds a `peak_bitrate` option. Without the option, output is byte-identical
+   to before.
+2. The app declares **18 Mb/s**, the TrueHD and Blu-ray maximum, allowing
+   access units of up to 1,875 bytes. Spectre's largest seen is 1,032.
+3. Every conversion records the size of every access unit during encoding, at
+   no extra cost, and fails if any exceeds the header's limit.
+4. The encoder self-test refuses any LibreMPEG without the patch.
+
+Access unit sizes depend on where encoding starts: a clip starting at 0:20.85
+put its oversized access units at different times than the full film. To
+reproduce an issue, a test clip must start at the same point as the full
+conversion.
+
+Verified on a Mac with two clips of Spectre's first minute with identical
+audio. The unfixed clip had the same nine over-limit access units; the fixed
+clip had none. Both decode bit-identical to the source. On the Fire TV and
+Denon, a 1.1.3 test clip played without the glitch.
+
+### Second issue: damaged subtitles and video
+
+- **Symptom:** reading Spectre, the Windows LibreMPEG build printed
+  "Unsupported encoding type" 46 times, once for each subtitle track.
+- **Cause:** Blu-ray PGS subtitles in MKV are usually zlib-compressed. The
+  LibreMPEG build lacked the zlib library, so it copied the subtitles *still
+  compressed* into a file that marks them as uncompressed (about a third of
+  the expected data, and unreadable). The same build also inserted a spurious
+  4,305-byte video packet at 0:25.1.
+- **Why it was missed:** the subtitle check compared only names, languages and
+  flags; the video check read both files with the same faulty build.
+- **Fix:** LibreMPEG is built with zlib. The self-test creates a tiny
+  zlib-compressed MKV and refuses any build that can't read it back. Every
+  copied track (video, audio and all subtitles) is now compared packet by
+  packet with the original, both read by the independent standard FFmpeg. On
+  Spectre all 48 tracks match, and a copy of the old faulty build is refused.
+
+### Release problems on the way
+
+| Problem | Fix |
+|---|---|
+| Build failed setting up MSYS2's deprecated MINGW64 environment | Switched to UCRT64 |
+| The patch was converted to Windows line endings on the build machine and wouldn't apply | `.gitattributes` keeps patch files byte-exact |
+| MSYS2 setup fails intermittently | Retried up to three times |
+| The `v1.1.2` tag pointed at a failed build | Released as 1.1.3; 1.1.2 was never published |
+
+### Remaining risks
+
+**Input timing is still constant.** Dolby's encoder schedules each access
+unit's arrival using a buffer model: data flows in at the declared peak rate,
+and big access units start arriving earlier so the buffer absorbs bursts. That
+lets Dolby declare a low, realistic peak (7.66 Mb/s in the sample above) even
+though single access units briefly exceed it. LibreMPEG has no buffer model.
+It gives every access unit the same timing, so each must fit in its own
+0.83 ms slot. Declaring 18 Mb/s makes that true for every access unit, which
+means the stream never asks the decoder to buffer anything. That is the most
+conservative possible schedule, and any decoder that buffers is also
+satisfied. What it is *not* is verified against Dolby's specification, which
+is only available to Dolby licensees together with Dolby's validation tools.
+Full certification would need those tools; reproducing Dolby's buffer
+scheduling in LibreMPEG would need the same specification. In practice the
+remaining risk is a receiver that dislikes the 18 Mb/s declaration itself.
+The Denon accepts it, and testing on more devices is the practical check.
+
+**A film could exceed the limit at high sample rates.** The 18 Mb/s TrueHD
+limit applies to Dolby's streams *with* buffering. Here each access unit must
+fit 1,875 bytes on its own, and LibreMPEG compresses less efficiently than
+Dolby (about 1.3x the size of the DTS-HD MA track on Spectre, and around 30%
+*larger* than raw PCM on incompressible audio). Worst case, measured with
+full-volume random noise on every channel:
+
+| Source | Raw audio per access unit | TrueHD worst case | Fits 1,875 bytes? |
+|---|---|---|---|
+| 7.1, 48 kHz | 960 B | 1,248 B (12.0 Mb/s) | Always |
+| 5.1, 48 kHz | 720 B | 934 B (9.0 Mb/s) | Always |
+| 5.1, 96 kHz | 1,440 B | 1,648 B (15.8 Mb/s) | Always |
+| 7.1, 96 kHz | 1,920 B | 2,192 B (21.0 Mb/s) | Can exceed |
+| 5.1, 192 kHz | 2,880 B | 3,094 B (29.7 Mb/s) | Can exceed |
+
+At 44.1/48 kHz, which covers almost all Blu-ray soundtracks including
+Spectre, exceeding the limit is impossible: even pure noise stays a third
+below it. For 7.1 at 96 kHz and 5.1 at 192 kHz it can happen in loud,
+complex passages. The app warns before converting such a source (and
+suggests a test clip of a loud scene first). If a passage doesn't fit, the
+conversion stops with a clear error rather than producing a file that
+glitches.
+
+### Other known differences from Dolby streams
+
+The dialogue-level and similar header fields are zero, and the built-in
+2-channel and 6-channel versions are simple channel subsets rather than proper
+downmixes. Neither has caused a problem on the Denon.
+
 ## License
 
 This project does not yet have a licence file, so the code is published but

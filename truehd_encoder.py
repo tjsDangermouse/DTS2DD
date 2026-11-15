@@ -111,6 +111,23 @@ def max_access_unit_bytes(peak_bitrate: int, sample_rate: int) -> float:
     return peak_bitrate * 40 / base / 8
 
 
+# On incompressible audio (full-scale noise) LibreMPEG's access units were
+# measured at up to ~1.3x the size of the raw PCM they carry: 1248 B for
+# 7.1/48k (960 B raw), 1648 B for 5.1/96k, 2192 B for 7.1/96k, 3094 B for
+# 5.1/192k.
+WORST_CASE_EXPANSION = 1.3
+
+
+def may_exceed_peak_rate(channels: int, sample_rate: int, bit_depth: int,
+                         peak_bitrate: int = TRUEHD_PEAK_BITRATE) -> bool:
+    """True when a loud passage could produce an access unit larger than the
+    declared peak rate allows (so the conversion might fail at the end)."""
+    base = 44100 if sample_rate % 44100 == 0 else 48000
+    samples_per_au = 40 * sample_rate // base
+    raw_bytes = channels * samples_per_au * max(bit_depth, 16) / 8
+    return raw_bytes * WORST_CASE_EXPANSION > max_access_unit_bytes(peak_bitrate, sample_rate)
+
+
 STATUS_READY = "TrueHD encoder ready"
 STATUS_MISSING = "TrueHD encoder missing"
 STATUS_NO_71 = "TrueHD 7.1 unsupported"

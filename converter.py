@@ -775,6 +775,8 @@ class ConverterApp:
             summary = f"A new MKV will be created:\n{target.name}\n\nThe original MKV is not modified."
         if not options.strict_verify:
             summary += "\n\nStrict lossless verification is OFF: the result will not be checked sample-by-sample."
+        for warning in source_warnings(stream):
+            summary += f"\n\nWarning: {warning}"
         if not messagebox.askyesno("Convert to Dolby TrueHD", summary + "\n\nContinue?"):
             return
 
