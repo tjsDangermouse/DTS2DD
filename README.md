@@ -236,7 +236,8 @@ DTS2DD/
 - AC-3/E-AC-3 and TrueHD conversions read and write the whole MKV, so large
   films are mostly limited by disk speed.
 - In testing on an Apple-silicon Mac, TrueHD encoding ran at about 44x real
-  time. Strict verification takes roughly as long again.
+  time. Strict verification then reads the new file once more; its speed is
+  mostly limited by the drive.
 
 ## Future Enhancements
 

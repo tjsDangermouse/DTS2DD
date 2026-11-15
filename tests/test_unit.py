@@ -301,6 +301,32 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("-ss", te.build_truehd_command("enc", self.job()))
         self.assertNotIn("-ss", te.build_source_decode_command("enc", self.job()))
 
+    def test_source_fingerprint_output(self):
+        plain = te.build_truehd_command("enc", self.job())
+        self.assertNotIn("hash", plain)
+        cmd = te.build_truehd_command("enc", self.job(), "/tmp/src.sha256")
+        mkv = cmd.index("/m/.tmp.mkv")
+        tail = cmd[mkv + 1:]
+        self.assertEqual(tail, ["-map", "0:1", "-c:a", "pcm_s32le", "-f", "hash",
+                                "-hash", "sha256", "/tmp/src.sha256"])
+        self.assertEqual(cmd[:mkv + 1], plain)      # MKV output itself unchanged
+
+    def test_output_hash_command_reads_only_output(self):
+        cmd = te.build_output_hash_command("ff", "/m/out.mkv", 2, "/tmp/out.sha256")
+        self.assertEqual(cmd[cmd.index("-i") + 1], "/m/out.mkv")
+        self.assertEqual(cmd.count("-i"), 1)
+        self.assertEqual(cmd[cmd.index("-map") + 1], "0:a:2")
+        self.assertEqual(cmd[-1], "/tmp/out.sha256")
+
+    def test_read_hash_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d, "h")
+            p.write_text("SHA256=" + "AB" * 32 + "\n")
+            self.assertEqual(te.read_hash_file(str(p)), "ab" * 32)
+            p.write_text("garbage")
+            self.assertIsNone(te.read_hash_file(str(p)))
+            self.assertIsNone(te.read_hash_file(str(Path(d, "missing"))))
+
     def test_end_padding_fix_applied(self):
         cmd = te.build_truehd_command("enc", self.job())
         self.assertEqual(cmd[cmd.index("-bsf:a:2") + 1], "side_data=remove=skip_samples")

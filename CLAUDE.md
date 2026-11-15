@@ -75,6 +75,7 @@ Main thread uses `root.after()` to safely update GUI from worker threads. Never 
 - DTS decoder output `s16p/s32p` = lossless XLL decode; `fltp` = lossy core only -> refuse.
 - LibreMPEG tags the short final access unit with discard_padding although it already coded only the real samples; in MKV that drops up to 39 real samples. Fixed with the `side_data` bsf (upstream FFmpeg lacks this bsf, so it fails the self-test).
 - Seeking (`-ss`) and encoding in one pass gave the TrueHD track a ~250 ms late start. Test clips are therefore cut by stream copy first, then converted like a whole file.
+- Strict verification is hash-based: the encode command has a second output (`-map 0:<src> -c:a pcm_s32le -f hash -hash sha256 <file>`) that fingerprints the exact PCM fed to the encoder; afterwards the independent FFmpeg decodes the TrueHD track FROM THE MKV and hashes it. The source film is never re-read (the old two-decoder comparison took ~50 min on a 36 GB film). Decoding from the MKV is deliberate - it is what exposes container bugs like the DiscardPadding one. `_locate_difference` (slow side-by-side compare) only runs after a mismatch, to report where.
 - The 2ch/6ch embedded presentations are channel subsets, not downmixes.
 
 ### Tests

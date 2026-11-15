@@ -598,7 +598,8 @@ def build_clip_cut_command(encoder: str, source: str, output: str,
             "-progress", "pipe:1", "-nostats", "-y", output]
 
 
-def build_truehd_command(encoder: str, job: TrueHDJob) -> List[str]:
+def build_truehd_command(encoder: str, job: TrueHDJob,
+                         source_hash_path: Optional[str] = None) -> List[str]:
     """LibreMPEG command that copies every stream and appends a TrueHD track.
 
     * Video, subtitles, other audio, chapters and attachments are copied
@@ -607,6 +608,9 @@ def build_truehd_command(encoder: str, job: TrueHDJob) -> List[str]:
       values, so FFmpeg can never insert a silent downmix or resample - the
       encoder fails instead.
     * No filters are used: no normalisation, DRC, EQ or remixing.
+    * With ``source_hash_path``, a second output writes the SHA-256 of the
+      decoded source PCM - the exact samples fed to the encoder - in the same
+      pass, so strict verification never has to re-read the source film.
     """
     from ffmpeg_helper import build_stream_maps  # shared with AC-3 workflow
 
@@ -636,7 +640,37 @@ def build_truehd_command(encoder: str, job: TrueHDJob) -> List[str]:
         "-progress", "pipe:1", "-nostats",
         "-y", job.output_path,
     ]
+    if source_hash_path:
+        # A real file, not pipe:N - extra pipe descriptors don't work on Windows.
+        cmd += ["-map", f"0:{job.source_stream_index}", "-c:a", "pcm_s32le",
+                "-f", "hash", "-hash", "sha256", source_hash_path]
     return cmd
+
+
+def build_output_hash_command(decoder: str, output_path: str, audio_index: int,
+                              hash_path: str) -> List[str]:
+    """SHA-256 of the TrueHD track decoded from the finished MKV.
+
+    Decoding from the MKV (not the encoder's raw packets) also covers
+    container-level problems such as the end-of-stream padding bug.
+    """
+    return [decoder, "-hide_banner", "-nostdin", "-v", "error", "-i", output_path,
+            "-map", f"0:a:{audio_index}", "-c:a", "pcm_s32le",
+            "-f", "hash", "-hash", "sha256",
+            "-progress", "pipe:1", "-nostats", "-y", hash_path]
+
+
+def read_hash_file(path: str) -> Optional[str]:
+    """Return the hex digest from an FFmpeg ``-f hash`` file (``SHA256=<hex>``)."""
+    try:
+        with open(path, "r", encoding="ascii", errors="replace") as f:
+            for line in f:
+                name, _, value = line.strip().partition("=")
+                if name.upper() == "SHA256" and re.fullmatch(r"[0-9a-fA-F]{64}", value):
+                    return value.lower()
+    except OSError:
+        pass
+    return None
 
 
 def build_source_decode_command(encoder: str, job: TrueHDJob) -> List[str]:
