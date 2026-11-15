@@ -9,7 +9,9 @@ from unittest import mock
 
 import helpers  # noqa: F401  (sets sys.path)
 
+import app_paths
 import app_settings
+import ffmpeg_downloader
 import ffmpeg_helper
 import media_probe
 import truehd_encoder as te
@@ -391,6 +393,48 @@ class FileSafetyTests(unittest.TestCase):
                 conv.convert(str(self.source), 0, tw.TrueHDOptions())
         self.assertIn("Not enough free disk space", str(ctx.exception))
         self.assertEqual(sorted(os.listdir(self.dir)), ["Spectre.mkv"])
+
+
+class InstalledLayoutTests(unittest.TestCase):
+    """Installed (frozen) app: bundled tools win, nothing is written beside the exe."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp()).resolve()
+        self.app = self.dir / "Programs" / "DTS2DD"
+        exe = app_paths.exe_name
+        for folder in ("ffmpeg", "librempeg"):
+            (self.app / folder).mkdir(parents=True)
+            for tool in ("ffmpeg", "ffprobe"):
+                (self.app / folder / exe(tool)).write_bytes(b"")
+        (self.app / exe("DTS to AC-3 Converter")).write_bytes(b"")
+        self.patches = [
+            mock.patch.object(app_paths.sys, "frozen", True, create=True),
+            mock.patch.object(app_paths.sys, "executable", str(self.app / exe("DTS to AC-3 Converter"))),
+            mock.patch.dict(os.environ, {"DTS2DD_DATA_DIR": str(self.dir / "LocalAppData" / "DTS2DD")}),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+        shutil.rmtree(self.dir)
+
+    def test_bundled_ffmpeg_preferred_over_path(self):
+        with mock.patch.object(ffmpeg_downloader.shutil, "which", return_value="/usr/bin/ffmpeg"):
+            found = ffmpeg_downloader.get_ffmpeg_path()
+        self.assertEqual(Path(found), self.app / "ffmpeg" / app_paths.exe_name("ffmpeg"))
+        self.assertEqual(Path(media_probe.find_ffprobe(found)),
+                         self.app / "ffmpeg" / app_paths.exe_name("ffprobe"))
+
+    def test_bundled_librempeg_discovered(self):
+        path, origin = te.discover_encoder(None)
+        self.assertEqual((Path(path), origin), (self.app / "librempeg" / app_paths.exe_name("ffmpeg"), "bundled"))
+
+    def test_downloads_go_to_user_folder(self):
+        target = ffmpeg_downloader.download_dir()
+        self.assertEqual(target, self.dir / "LocalAppData" / "DTS2DD" / "ffmpeg")
+        self.assertNotIn(str(self.app), str(target))
 
 
 class SettingsTests(unittest.TestCase):

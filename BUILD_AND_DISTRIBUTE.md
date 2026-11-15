@@ -91,32 +91,89 @@ To distribute without warnings, you would need an Apple Developer certificate ($
 
 ## Building on Windows
 
-### Quick Build (Recommended)
+The Windows deliverable is an installer, `DTS2DD-Setup-<version>.exe`
+(Inno Setup), containing a PyInstaller **one-folder** build plus FFmpeg and
+LibreMPEG. One-folder starts quickly (a single-file exe unpacks ~200 MB to
+%TEMP% on every launch) and is less likely to upset antivirus software.
 
-```bash
+```
+%LOCALAPPDATA%\Programs\DTS2DD\
+  DTS to AC-3 Converter.exe     PyInstaller launcher
+  _internal\                    Python runtime and app modules
+  ffmpeg\ffmpeg.exe, ffprobe.exe        standard FFmpeg (gyan.dev, pinned)
+  librempeg\ffmpeg.exe, ffprobe.exe     LibreMPEG (TrueHD), pinned commit
+  licenses\                     third-party licences and source pointers
+  unins000.exe                  uninstaller
+```
+
+The app looks for these folders beside its exe first, writes nothing into its
+program folder, keeps settings in `%APPDATA%\DTS2DD`, and only downloads FFmpeg
+(into `%LOCALAPPDATA%\DTS2DD\ffmpeg`) if the bundled copy is missing.
+
+### Recommended: GitHub Actions
+
+`.github/workflows/windows-installer.yml` runs on every push to `master` or
+`feature/**`, on pull requests, on `v*` tags, and manually ("Run workflow"):
+
+1. Builds LibreMPEG from the pinned commit with MSYS2 (statically linked;
+   cached after the first run, which takes ~20-30 min) and fails if it depends
+   on MinGW DLLs or lacks the TrueHD 7.1 encoder / `side_data` filter.
+2. Downloads the pinned FFmpeg build and checks its SHA-256.
+3. Runs the full test suite (unit + integration) **on Windows** with those
+   binaries; fails if integration tests were skipped.
+4. Builds the app folder, adds the tools and licences, and runs
+   `"DTS to AC-3 Converter.exe" --self-test` on it.
+5. Compiles the installer, installs it silently, checks the Start menu
+   shortcut, self-tests the **installed** app (it must use its bundled
+   FFmpeg and LibreMPEG), then uninstalls it.
+6. Uploads the installer, self-test reports and test results as the
+   workflow artifact. On a `v1.2.3` tag (must match `version.py`) it also
+   attaches the installer to a GitHub release.
+
+To release: bump `version.py`, commit, `git tag v1.1.0 && git push --tags`.
+
+To update FFmpeg: change `FFMPEG_VERSION`, `FFMPEG_URL` and `FFMPEG_SHA256` in
+the workflow (`https://www.gyan.dev/ffmpeg/builds/release-version` and the
+`.sha256` file next to the zip give the values). To update LibreMPEG: change
+`LIBREMPEG_COMMIT` and re-verify (the self-test and tests must pass).
+
+### Local build (`build_windows.bat`)
+
+Needs Python 3.11+, and for the installer Inno Setup 6.3+. Put the tools in
+`vendor\` first (or copy them from a workflow run):
+
+```
+vendor\ffmpeg\ffmpeg.exe, ffprobe.exe, LICENSE
+vendor\librempeg\ffmpeg.exe, ffprobe.exe, COPYING.AGPLv3, LICENSE.md
+```
+
+```bat
 cd path\to\DTS2DD
 build_windows.bat
 ```
 
-The script will:
-1. Install build dependencies
-2. Generate application icon
-3. Build the `.exe` file
-4. Output to `dist\DTS to AC-3 Converter.exe`
+It builds `dist\DTS2DD\`, adds the tools and licences, runs the self-test,
+and (if Inno Setup is installed) writes `dist\installer\DTS2DD-Setup-<version>.exe`.
+Missing tools only produce warnings: the app then downloads FFmpeg on first
+run and/or TrueHD users select LibreMPEG themselves.
+
+### Code signing
+
+The installer and app are not signed, so SmartScreen shows "Windows protected
+your PC" (More info -> Run anyway) until the download builds reputation. Only
+an Authenticode certificate (e.g. Azure Trusted Signing, or an OV/EV
+certificate) removes this; sign `dist\DTS2DD\*.exe` before compiling the
+installer and the installer afterwards with `signtool`.
 
 ### Manual Build Steps
 
 If the script fails, build manually:
 
 ```bash
-# Install dependencies
-pip install pyinstaller pillow py7zr
-
-# Create icons
+pip install -r requirements.txt pyinstaller pillow
 python create_icon.py
-
-# Build executable
-pyinstaller --clean converter.spec
+python -m PyInstaller --noconfirm --clean converter.spec      # -> dist\DTS2DD\
+"%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" /DAppVersion=1.1.0 installer\DTS2DD.iss
 ```
 
 ### Installing to Start Menu/Desktop
@@ -218,8 +275,13 @@ and `--pkg-config-flags` options, with Xcode command-line tools and `nasm`.
 
 ### Bundling and licensing
 
-- `build_windows.bat` copies a `librempeg\` folder into `dist\` if one exists
-  beside the script; otherwise users select the executable in the app.
+- The Windows installer bundles LibreMPEG (built by the GitHub workflow from
+  the pinned commit) and FFmpeg, with their licences in `licenses\` and
+  `installer\THIRD_PARTY_NOTICES.txt`.
+- The gyan.dev FFmpeg build is **GPL v3**; LibreMPEG built with `--enable-agpl`
+  is **AGPL v3+**. For your own use nothing more is needed. If you give the
+  installer to others, also make the corresponding source available (the
+  notices point to the exact FFmpeg release and LibreMPEG commit).
 - A LibreMPEG `ffmpeg` built with `--enable-agpl` is licensed **AGPL v3 or
   later**. If you distribute it with the app you must also provide (or offer)
   the corresponding LibreMPEG source and the license text (`COPYING.AGPLv3`),

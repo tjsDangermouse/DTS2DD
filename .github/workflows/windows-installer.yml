@@ -1,0 +1,203 @@
+name: Windows installer
+
+# Builds LibreMPEG (TrueHD encoder) from a pinned commit, runs the full test
+# suite on Windows, packages the app with PyInstaller (one-folder) together
+# with FFmpeg and LibreMPEG, compiles the Inno Setup installer, then installs
+# it silently and self-tests the INSTALLED app before publishing it.
+
+on:
+  push:
+    branches: [master, "feature/**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # only used to attach the installer to a GitHub release on v* tags
+
+env:
+  # LibreMPEG commit verified for bit-exact TrueHD 5.1/7.1 (see BUILD_AND_DISTRIBUTE.md)
+  LIBREMPEG_COMMIT: 2f18174fc205e364026c6fdc69ab5431c86b32ba
+  # Standard FFmpeg (AC-3 / E-AC-3, independent verification decoder). gyan.dev
+  # "release essentials" build, pinned by version and SHA-256.
+  FFMPEG_VERSION: 9.0.2
+  FFMPEG_URL: https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip
+  FFMPEG_SHA256: 60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
+  PYTHONUTF8: "1"
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------- LibreMPEG
+      - name: Restore LibreMPEG build
+        id: librempeg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: vendor/librempeg
+          key: librempeg-win64-${{ env.LIBREMPEG_COMMIT }}-v1
+
+      - name: Set up MSYS2
+        if: steps.librempeg-cache.outputs.cache-hit != 'true'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git make diffutils
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-pkgconf
+
+      - name: Build LibreMPEG
+        if: steps.librempeg-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          git config --global core.autocrlf false
+          git clone --filter=blob:none https://github.com/librempeg/librempeg.git src-librempeg
+          cd src-librempeg
+          git checkout "$LIBREMPEG_COMMIT"
+          ./configure --enable-agpl --disable-doc --disable-network --disable-autodetect \
+                      --disable-ffplay --disable-shared --enable-static \
+                      --extra-ldflags=-static --pkg-config-flags=--static
+          make -j"$(nproc)"
+          # Must run on a clean PC: no MinGW/MSYS2 DLL dependencies allowed
+          if ldd ffmpeg.exe ffprobe.exe | grep -i -E "mingw64|msys"; then
+            echo "LibreMPEG has MinGW DLL dependencies"; exit 1
+          fi
+          ./ffmpeg.exe -hide_banner -h encoder=truehd | tee ../truehd-encoder.txt
+          grep -q " 7.1" ../truehd-encoder.txt
+          ./ffmpeg.exe -hide_banner -h bsf=side_data > /dev/null
+          mkdir -p ../vendor/librempeg
+          cp ffmpeg.exe ffprobe.exe COPYING.AGPLv3 COPYING.GPLv3 LICENSE.md ../vendor/librempeg/
+          echo "$LIBREMPEG_COMMIT" > ../vendor/librempeg/SOURCE_COMMIT.txt
+
+      - name: Save LibreMPEG build
+        if: steps.librempeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vendor/librempeg
+          key: librempeg-win64-${{ env.LIBREMPEG_COMMIT }}-v1
+
+      # ------------------------------------------------------------------- FFmpeg
+      - name: Download FFmpeg (checksum verified)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:FFMPEG_URL -OutFile ffmpeg.zip
+          $actual = (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash
+          if ($actual -ne $env:FFMPEG_SHA256) { throw "FFmpeg SHA-256 mismatch: $actual" }
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extract
+          $root = Get-ChildItem ffmpeg-extract -Directory | Select-Object -First 1
+          New-Item -ItemType Directory -Force vendor/ffmpeg | Out-Null
+          Copy-Item "$($root.FullName)\bin\ffmpeg.exe", "$($root.FullName)\bin\ffprobe.exe", "$($root.FullName)\LICENSE" vendor/ffmpeg/
+          "$env:FFMPEG_VERSION $env:FFMPEG_URL" | Out-File vendor/ffmpeg/SOURCE.txt -Encoding utf8
+
+      # ------------------------------------------------------------------- Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller pillow pytest
+
+      - name: Run tests on Windows (unit + integration)
+        shell: pwsh
+        env:
+          DTS2DD_SETTINGS_DIR: ${{ runner.temp }}\dts2dd-settings
+        run: |
+          $env:DTS2DD_LIBREMPEG = (Resolve-Path vendor/librempeg/ffmpeg.exe).Path
+          $env:DTS2DD_FFMPEG = (Resolve-Path vendor/ffmpeg/ffmpeg.exe).Path
+          python tests/fetch_samples.py
+          python -m pytest tests -v -rs --junitxml=test-results.xml
+          # Integration tests must have run, not been skipped
+          if (Select-String -Path test-results.xml -Pattern 'message="(LibreMPEG / FFmpeg|FATE samples)' -Quiet) {
+            throw "Integration tests were skipped" }
+
+      # ---------------------------------------------------------------- Package
+      - name: Build app (PyInstaller one-folder)
+        run: |
+          python create_icon.py
+          python -m PyInstaller --noconfirm --clean converter.spec
+
+      - name: Add FFmpeg, LibreMPEG and licences to the app folder
+        shell: pwsh
+        run: |
+          $app = "dist/DTS2DD"
+          New-Item -ItemType Directory -Force "$app/ffmpeg", "$app/librempeg", "$app/licenses" | Out-Null
+          Copy-Item vendor/ffmpeg/ffmpeg.exe, vendor/ffmpeg/ffprobe.exe "$app/ffmpeg/"
+          Copy-Item vendor/librempeg/ffmpeg.exe, vendor/librempeg/ffprobe.exe "$app/librempeg/"
+          Copy-Item vendor/ffmpeg/LICENSE "$app/licenses/FFmpeg-LICENSE.txt"
+          Copy-Item vendor/ffmpeg/SOURCE.txt "$app/licenses/FFmpeg-SOURCE.txt"
+          Copy-Item vendor/librempeg/COPYING.AGPLv3 "$app/licenses/LibreMPEG-COPYING.AGPLv3.txt"
+          Copy-Item vendor/librempeg/LICENSE.md "$app/licenses/LibreMPEG-LICENSE.md"
+          "https://github.com/librempeg/librempeg/tree/$env:LIBREMPEG_COMMIT" | Out-File "$app/licenses/LibreMPEG-SOURCE.txt" -Encoding utf8
+          Copy-Item installer/THIRD_PARTY_NOTICES.txt "$app/licenses/"
+
+      - name: Self-test the packaged app
+        shell: pwsh
+        run: |
+          $p = Start-Process "dist/DTS2DD/DTS to AC-3 Converter.exe" -ArgumentList "--self-test", "$PWD\selftest-folder.json" -Wait -PassThru
+          Get-Content selftest-folder.json
+          if ($p.ExitCode -ne 0) { throw "Packaged app self-test failed" }
+
+      - name: Compile installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco upgrade innosetup -y --no-progress   # needs 6.3+ for x64compatible
+          $version = python -c "from version import __version__; print(__version__)"
+          if ($env:GITHUB_REF -like "refs/tags/v*" -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match version.py ($version)" }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer/DTS2DD.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          "VERSION=$version" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ------------------------------------------------- Install, test, uninstall
+      - name: Install silently and self-test the installed app
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist/installer/DTS2DD-Setup-*.exe | Select-Object -First 1
+          $p = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$PWD\install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log; throw "Installer failed" }
+          $installed = "$env:LOCALAPPDATA\Programs\DTS2DD\DTS to AC-3 Converter.exe"
+          if (-not (Test-Path $installed)) { throw "App not installed at $installed" }
+          $startMenu = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\DTS to AC-3 Converter.lnk"
+          if (-not (Test-Path $startMenu)) { throw "Start menu shortcut missing" }
+          $p = Start-Process $installed -ArgumentList "--self-test", "$PWD\selftest-installed.json" -Wait -PassThru
+          Get-Content selftest-installed.json
+          if ($p.ExitCode -ne 0) { throw "Installed app self-test failed" }
+          $report = Get-Content selftest-installed.json | ConvertFrom-Json
+          if ($report.encoder_origin -ne "bundled") { throw "Installed app did not use its bundled LibreMPEG" }
+          if ($report.ffmpeg -notlike "$env:LOCALAPPDATA\Programs\DTS2DD\*") { throw "Installed app did not use its bundled FFmpeg: $($report.ffmpeg)" }
+
+      - name: Uninstall silently
+        shell: pwsh
+        run: |
+          Start-Process "$env:LOCALAPPDATA\Programs\DTS2DD\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+          # The uninstaller re-launches itself from %TEMP%; wait for it to finish
+          $exe = "$env:LOCALAPPDATA\Programs\DTS2DD\DTS to AC-3 Converter.exe"
+          for ($i = 0; $i -lt 60 -and (Test-Path $exe); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path $exe) { throw "Uninstall left the app behind" }
+          $startMenu = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\DTS to AC-3 Converter.lnk"
+          if (Test-Path $startMenu) { throw "Uninstall left the Start menu shortcut" }
+
+      # ---------------------------------------------------------------- Publish
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DTS2DD-Setup-${{ env.VERSION || 'failed' }}
+          path: |
+            dist/installer/*.exe
+            selftest-*.json
+            test-results.xml
+            install.log
+          if-no-files-found: warn
+
+      - name: Attach installer to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/installer/*.exe

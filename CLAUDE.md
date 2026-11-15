@@ -39,6 +39,8 @@ DTS to AC-3/DD+ Converter: A cross-platform GUI application that converts DTS au
 
 **truehd_workflow.py** - `TrueHDConverter.convert()`: validate source -> disk space -> hidden temp in source dir -> (clip: stream-copy cut first) -> encode -> `_verify_output()` checks -> optional `_strict_compare()` (streams both decodes as s32le and compares) -> rename to `_Sound_TrueHD.mkv` or leave for GUI-confirmed `finalize_replace()`
 
+**app_paths.py** - `app_dir()` (exe folder when frozen), `user_data_dir()` (%LOCALAPPDATA%\DTS2DD), `ffmpeg_folders()`: bundled `ffmpeg/` beside the exe -> (PATH, checked in ffmpeg_downloader) -> per-user download folder -> legacy `./ffmpeg`. Never write into the program folder.
+
 **app_settings.py** - JSON settings in %APPDATA%/DTS2DD (or `DTS2DD_SETTINGS_DIR`); stores `truehd_encoder_path`
 
 **audio_stream_info.py** - Data model
@@ -88,11 +90,11 @@ Main thread uses `root.after()` to safely update GUI from worker threads. Never 
 Outputs: `dist/DTS to AC-3 Converter.app`
 Install to Applications: `cp -r dist/"DTS to AC-3 Converter.app" /Applications/`
 
-### Windows Build
-```bash
-build_windows.bat
-```
-Outputs: `dist/DTS to AC-3 Converter.exe`
+### Windows Build (installer)
+CI: `.github/workflows/windows-installer.yml` builds LibreMPEG (pinned commit, MSYS2, static), downloads pinned FFmpeg (SHA-256 checked), runs all tests on Windows, PyInstaller one-folder build -> `dist/DTS2DD/`, adds `ffmpeg/`, `librempeg/`, `licenses/`, compiles `installer/DTS2DD.iss` (Inno Setup, per-user, no admin), installs silently and runs the installed app's `--self-test`.
+Local: `build_windows.bat` with tools in `vendor/ffmpeg` and `vendor/librempeg`.
+`converter.spec` is one-folder on Windows (or with `DTS2DD_ONEDIR=1`), single-file `.app` on macOS.
+`"DTS to AC-3 Converter.exe" --self-test report.json` checks bundled tools headlessly (exit 0 = TrueHD ready). Version lives in `version.py`.
 
 Both use PyInstaller with `converter.spec` configuration. Icons are embedded (PNG, ICO, ICNS).
 
@@ -184,6 +186,10 @@ media_probe.py            # ffprobe JSON + verification helpers
 truehd_encoder.py         # LibreMPEG TrueHD backend + self-test
 truehd_workflow.py        # TrueHD conversion/verification workflow
 app_settings.py           # Persistent settings
+app_paths.py              # Program / per-user folders, bundled tool lookup
+version.py                # App version (window title, installer, release tag)
+installer/                # Inno Setup script + third-party notices
+.github/workflows/        # Windows installer build + tests
 audio_stream_info.py      # Data model
 tests/                    # unit + integration tests, fetch_samples.py
 create_icon.py            # Icon generator

@@ -42,8 +42,10 @@ ffmpeg/
 # Build artifacts
 *.spec.bak
 
-# LibreMPEG (TrueHD encoder) binaries placed beside the app
+# Third-party binaries for local Windows builds (see build_windows.bat)
+vendor/
 librempeg/
+selftest*.json
 
 # Test samples downloaded by tests/fetch_samples.py
 tests/samples/

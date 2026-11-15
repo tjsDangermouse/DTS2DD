@@ -7,6 +7,7 @@ These do NOT test Plex, Fire TV or AV-receiver behaviour - see USER_GUIDE.md.
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -326,7 +327,8 @@ class ExistingWorkflowTests(Workdir):
             str(source), bitrate, FFMPEG, streams[0].stream_index, len(streams),
             codec=codec, remove_source_stream=remove))
         out = self.probe(source)
-        self.assertEqual(os.stat(source).st_mode & 0o777, 0o644, "permissions kept")
+        if os.name != "nt":   # POSIX permission bits; Windows uses inherited ACLs
+            self.assertEqual(os.stat(source).st_mode & 0o777, 0o644, "permissions kept")
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["Movie.mkv"])
         return out
 
@@ -371,11 +373,12 @@ class PackagingTests(unittest.TestCase):
     def test_pyinstaller_build(self):
         with tempfile.TemporaryDirectory() as d:
             result = subprocess.run(
-                ["python3", "-m", "PyInstaller", "--noconfirm", "--clean", "--distpath", f"{d}/dist",
+                [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--distpath", f"{d}/dist",
                  "--workpath", f"{d}/build", "converter.spec"],
                 cwd=helpers.ROOT, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr[-2000:])
             warn = Path(d, "build", "converter", "warn-converter.txt")
+            self.assertTrue(any(Path(d, "dist").iterdir()), "no build output")
             if warn.exists():
                 text = warn.read_text()
                 for module in ("truehd_encoder", "truehd_workflow", "media_probe", "app_settings"):

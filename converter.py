@@ -9,13 +9,14 @@ from tkinter import (
 )
 
 from app_settings import get_setting, set_setting
-from ffmpeg_downloader import ensure_ffmpeg_available
+from ffmpeg_downloader import ensure_ffmpeg_available, get_ffmpeg_path
 from ffmpeg_helper import ConversionCancelled, ProcessHandle, get_audio_streams, convert_and_append_audio
 from media_probe import find_ffprobe, parse_timecode
 from truehd_encoder import (
     LAYOUT_LABELS, STATUS_MISSING, STATUS_NO_71, STATUS_NOT_VERIFIED, STATUS_READY,
     TrueHDError, check_encoder, create_channel_test_file,
 )
+from version import __version__
 from truehd_workflow import (
     TrueHDConverter, TrueHDOptions, find_stale_partials, output_name, source_warnings,
     validate_source,
@@ -38,7 +39,7 @@ class ConverterApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("DTS to AC-3 Converter")
+        self.root.title(f"DTS to AC-3 Converter {__version__}")
         self.root.geometry("860x900")
         self.root.minsize(760, 640)
         self.ffmpeg_path = None
@@ -857,8 +858,39 @@ class ConverterApp:
             self._detect_audio()
 
 
+def run_self_test(report_path: str) -> int:
+    """Headless check used by the Windows build after installing.
+
+    Writes a JSON report and returns 0 only when the bundled FFmpeg is found
+    and the TrueHD encoder passes its self-test. Never downloads anything.
+    """
+    import json
+    from dataclasses import asdict
+    from app_paths import app_dir
+
+    ffmpeg = get_ffmpeg_path()
+    report = check_encoder(get_setting("truehd_encoder_path"), reference_decoder=ffmpeg)
+    data = {
+        "version": __version__,
+        "app_dir": str(app_dir()),
+        "ffmpeg": ffmpeg,
+        "ffprobe": find_ffprobe(ffmpeg, report.path),
+        "encoder": report.path,
+        "encoder_origin": report.origin,
+        "status": report.status,
+        "message": report.message,
+        "tests": [asdict(t) for t in report.tests],
+    }
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    ok = bool(ffmpeg and data["ffprobe"]) and report.status == STATUS_READY
+    return 0 if ok else 1
+
+
 def main():
     """Main entry point."""
+    if len(sys.argv) == 3 and sys.argv[1] == "--self-test":
+        sys.exit(run_self_test(sys.argv[2]))
     root = Tk()
     app = ConverterApp(root)
     root.mainloop()

@@ -9,6 +9,8 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
+from app_paths import ffmpeg_folders, find_tool, user_data_dir
+
 try:
     import py7zr
 except ImportError:
@@ -20,35 +22,32 @@ def get_ffmpeg_path() -> Optional[str]:
     Get the path to FFmpeg binary.
 
     Checks in order:
-    1. System PATH
-    2. Local ./ffmpeg/ directory (direct)
-    3. Local ./ffmpeg/ directory (recursive search)
+    1. ffmpeg/ folder bundled beside the app (installed builds)
+    2. System PATH
+    3. Per-user download folder (%LOCALAPPDATA%\\DTS2DD\\ffmpeg on Windows)
+    4. Legacy ./ffmpeg/ folder (development checkouts)
 
     Returns:
         Path to ffmpeg binary if found, None otherwise
     """
-    # Check system PATH
+    folders = ffmpeg_folders()
+    bundled = find_tool("ffmpeg", folders[:1])
+    if bundled:
+        return str(bundled)
+
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path:
         return ffmpeg_path
 
-    # Check local ./ffmpeg/ directory (direct)
-    local_ffmpeg_dir = Path("./ffmpeg")
-    if platform.system() == "Windows":
-        local_ffmpeg = local_ffmpeg_dir / "ffmpeg.exe"
-    else:
-        local_ffmpeg = local_ffmpeg_dir / "ffmpeg"
+    found = find_tool("ffmpeg", folders[1:])
+    return str(found) if found else None
 
-    if local_ffmpeg.exists():
-        return str(local_ffmpeg)
 
-    # Check for ffmpeg in nested folders (from extraction)
-    if local_ffmpeg_dir.exists():
-        for exe_file in local_ffmpeg_dir.rglob("ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"):
-            if exe_file.is_file():
-                return str(exe_file)
-
-    return None
+def download_dir() -> Path:
+    """Writable folder for a downloaded FFmpeg (never the program folder)."""
+    folder = user_data_dir() / "ffmpeg"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
 def verify_ffmpeg(ffmpeg_path: str) -> bool:
@@ -83,8 +82,7 @@ def download_ffmpeg(progress_callback=None) -> bool:
         True on success, False on failure
     """
     system = platform.system()
-    ffmpeg_dir = Path("./ffmpeg")
-    ffmpeg_dir.mkdir(exist_ok=True)
+    download_dir()
 
     try:
         if system == "Darwin":  # macOS
@@ -104,7 +102,7 @@ def download_ffmpeg(progress_callback=None) -> bool:
 def _download_ffmpeg_macos(progress_callback=None) -> bool:
     """Download and extract FFmpeg for macOS."""
     url = "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/7z"
-    ffmpeg_dir = Path("./ffmpeg")
+    ffmpeg_dir = download_dir()
     archive_path = ffmpeg_dir / "ffmpeg.7z"
 
     if progress_callback:
@@ -165,7 +163,7 @@ def _download_ffmpeg_macos(progress_callback=None) -> bool:
 def _download_ffmpeg_windows(progress_callback=None) -> bool:
     """Download and extract FFmpeg for Windows."""
     url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-    ffmpeg_dir = Path("./ffmpeg")
+    ffmpeg_dir = download_dir()
     archive_path = ffmpeg_dir / "ffmpeg.zip"
 
     if progress_callback:

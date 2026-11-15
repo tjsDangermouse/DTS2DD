@@ -19,6 +19,13 @@ A cross-platform Python application with a simple GUI for converting DTS audio i
 
 ## Installation
 
+**Windows:** run `DTS2DD-Setup-<version>.exe` (from the GitHub Actions
+artifact or a GitHub release), click Install, done. FFmpeg and the TrueHD
+encoder are included. The installer is unsigned, so SmartScreen may ask you to
+click "More info" -> "Run anyway". See BUILD_AND_DISTRIBUTE.md for how it is built.
+
+**From source:**
+
 1. Clone or download this repository
 2. Install dependencies:
    ```bash

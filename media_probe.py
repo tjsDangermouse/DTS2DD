@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from app_paths import ffmpeg_folders, find_tool
 from audio_stream_info import AudioStreamInfo
 
 
@@ -30,7 +31,7 @@ def find_ffprobe(*ffmpeg_paths: Optional[str]) -> Optional[str]:
     """Locate an ffprobe executable.
 
     Search order: next to each given ffmpeg binary, then PATH, then the
-    app-local ./ffmpeg/ folder (the Windows download nests it in bin/).
+    bundled / downloaded / legacy ffmpeg folders (see app_paths).
     """
     for ffmpeg_path in ffmpeg_paths:
         if not ffmpeg_path:
@@ -43,12 +44,8 @@ def find_ffprobe(*ffmpeg_paths: Optional[str]) -> Optional[str]:
     if on_path:
         return on_path
 
-    local_dir = Path("./ffmpeg")
-    if local_dir.is_dir():
-        for candidate in local_dir.rglob(_exe_name("ffprobe")):
-            if candidate.is_file():
-                return str(candidate)
-    return None
+    found = find_tool("ffprobe", ffmpeg_folders())
+    return str(found) if found else None
 
 
 def run_ffprobe(ffprobe_path: str, file_path: str, timeout: int = 120) -> Dict:

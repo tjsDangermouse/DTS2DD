@@ -27,18 +27,18 @@ A simple, easy-to-use application to convert DTS audio in MKV files to Dolby Dig
 
 ### Windows
 
-1. **Download the App**
-   - Get `DTS to AC-3 Converter.exe` (approximately 150-250MB)
+1. **Run the installer** `DTS2DD-Setup-<version>.exe`.
+   - Windows may say "Windows protected your PC" because the installer is not
+     code-signed. Click **More info**, then **Run anyway**.
+   - No administrator password is needed.
+2. Click **Install**, then **Finish** (the app opens straight away).
+3. Next time, open **DTS to AC-3 Converter** from the Start menu or the
+   desktop shortcut.
 
-2. **Run the App**
-   - Double-click the executable
-   - Windows may show a security prompt
-   - Click "Run anyway" or "Yes"
-
-3. **Create Shortcut (Optional)**
-   - Right-click `DTS to AC-3 Converter.exe`
-   - Select "Send to" → "Desktop (create shortcut)"
-   - Now you can launch from desktop
+That is all: FFmpeg and the LibreMPEG TrueHD encoder are included, so nothing
+is downloaded and nothing needs configuring. The app installs to
+`%LOCALAPPDATA%\Programs\DTS2DD`; settings are kept in `%APPDATA%\DTS2DD`.
+Installing a newer version over the top keeps your settings.
 
 ## Using the Application
 
@@ -154,14 +154,19 @@ Standard FFmpeg's TrueHD encoder stops at 5.1, so TrueHD uses a separate
 encoder, **LibreMPEG** (https://github.com/librempeg/librempeg). It does not
 replace the FFmpeg the app uses for AC-3/E-AC-3.
 
-LibreMPEG publishes no official Windows download. Either build it yourself
-(see BUILD_AND_DISTRIBUTE.md, "LibreMPEG for TrueHD") or obtain a build you
-trust. Then **either**:
+**Windows installer: nothing to do.** The installer includes a LibreMPEG
+build made from the verified source commit; the status should read
+*TrueHD encoder ready* on first launch.
 
-- put `ffmpeg.exe` and `ffprobe.exe` from LibreMPEG in a folder called
-  `librempeg` next to `DTS to AC-3 Converter.exe`, **or**
+Otherwise (macOS, or running from source), LibreMPEG publishes no official
+download. Build it yourself (see BUILD_AND_DISTRIBUTE.md, "LibreMPEG for
+TrueHD") or obtain a build you trust, then **either**:
+
+- put `ffmpeg` and `ffprobe` from LibreMPEG in a folder called `librempeg`
+  next to the app, **or**
 - choose **Dolby TrueHD (Lossless)**, click **Browse...** next to *Encoder
-  status* and select LibreMPEG's `ffmpeg.exe`. The path is remembered.
+  status* and select LibreMPEG's `ffmpeg`. The path is remembered and takes
+  priority over the bundled copy.
 
 Every time the app starts (or you click **Re-check**) it self-tests the
 encoder: it encodes labelled test audio for 5.1 and 7.1 at 16 and 24-bit,
@@ -491,9 +496,10 @@ A: No, internet is only needed on first run for FFmpeg download.
 3. Empty Trash
 
 ### Windows
-1. Open Programs & Features (Settings → Apps)
+1. Open Settings → Apps → Installed apps
 2. Find "DTS to AC-3 Converter"
-3. Click Uninstall
+3. Click Uninstall (this removes the app, its shortcuts and the bundled tools;
+   your settings in `%APPDATA%\DTS2DD` are kept)
 
 ## Support
 

@@ -1,0 +1,25 @@
+DTS to AC-3 Converter - third-party software
+============================================
+
+This installation includes two separate programs that the converter runs as
+external processes. They are not linked into the converter.
+
+1. FFmpeg (folder: ffmpeg\)
+   Used for AC-3 / E-AC-3 conversion, probing and independent verification.
+   Build: gyan.dev "release essentials" (see FFmpeg-SOURCE.txt for version).
+   Licence: GNU General Public License version 3 (see FFmpeg-LICENSE.txt).
+   Source code: https://ffmpeg.org/download.html and https://www.gyan.dev/ffmpeg/builds/
+
+2. LibreMPEG (folder: librempeg\)
+   Used only for Dolby TrueHD encoding.
+   Built from https://github.com/librempeg/librempeg at the commit listed in
+   LibreMPEG-SOURCE.txt with --enable-agpl.
+   Licence: GNU Affero General Public License version 3 or later
+   (see LibreMPEG-COPYING.AGPLv3.txt and LibreMPEG-LICENSE.md).
+   Corresponding source code: the commit above. The exact build commands are
+   in .github/workflows/windows-installer.yml of
+   https://github.com/tjsDangermouse/DTS2DD
+
+Dolby, Dolby TrueHD and Dolby Atmos are trademarks of Dolby Laboratories.
+DTS and DTS-HD are trademarks of DTS, Inc. This software is not certified by
+or affiliated with either company.
