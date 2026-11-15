@@ -41,3 +41,10 @@ ffmpeg/
 
 # Build artifacts
 *.spec.bak
+
+# LibreMPEG (TrueHD encoder) binaries placed beside the app
+librempeg/
+
+# Test samples downloaded by tests/fetch_samples.py
+tests/samples/
+.pytest_cache/

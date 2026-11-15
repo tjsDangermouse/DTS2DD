@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-DTS to AC-3/DD+ Converter: A cross-platform GUI application that converts DTS audio in MKV files to AC-3 (Dolby Digital) or E-AC-3 (Dolby Digital Plus) format. The app automatically detects and downloads FFmpeg on first run, making it completely self-contained.
+DTS to AC-3/DD+ Converter: A cross-platform GUI application that converts DTS audio in MKV files to AC-3 (Dolby Digital) or E-AC-3 (Dolby Digital Plus) format, and DTS-HD Master Audio 5.1/7.1 to lossless Dolby TrueHD. The app automatically detects and downloads FFmpeg on first run. TrueHD uses a separately configured LibreMPEG executable (never auto-downloaded).
 
 ## Architecture
 
@@ -23,14 +23,27 @@ DTS to AC-3/DD+ Converter: A cross-platform GUI application that converts DTS au
 - Windows: Downloads ZIP from gyan.dev, extracts with built-in zipfile
 - Key function: `ensure_ffmpeg_available()` - called at app startup
 
-**ffmpeg_helper.py** - FFmpeg subprocess management
-- `get_audio_streams()`: Probes MKV file with FFmpeg, parses stderr using regex to extract codec, channels, bitrate, language
-- `convert_to_ac3()`: Executes FFmpeg conversion with codec support (ac3 or eac3)
-- Uses subprocess.run() for reliable file I/O and proper buffering
+**ffmpeg_helper.py** - FFmpeg subprocess management (shared by both workflows)
+- `get_audio_streams()`: ffprobe JSON when ffprobe is found, else the original regex parse of `ffmpeg -i` stderr
+- `build_stream_maps()`: maps all streams + the selected audio again; attachments are mapped LAST (Matroska muxer fails otherwise)
+- `convert_and_append_audio()`: AC-3/E-AC-3 in-place workflow (temp file -> `os.replace`)
+- `run_ffmpeg()`: Popen with `-progress pipe:1`, stderr drained on a thread (last 200 lines kept for errors), cancellation via `ProcessHandle`
+
+**media_probe.py** - ffprobe JSON, `classify_audio()` (DTS / DTS-HD HRA / DTS-HD MA / DTS:X / TrueHD / TrueHD Atmos / DD / DD+, "Unknown" when unsure), video signature + `video_packet_hashes()` (framemd5 of copied packets) for preservation checks
+
+**truehd_encoder.py** - LibreMPEG backend
+- `discover_encoder()`: configured path -> `librempeg/` beside the app -> `librempeg` on PATH -> an `ffmpeg` on PATH that advertises TrueHD 7.1
+- `check_encoder()`: parses `-h encoder=truehd`, then self-tests 5.1(side)/7.1 at 16/24-bit: labelled synthetic PCM -> TrueHD MKV -> decoded by LibreMPEG AND standard FFmpeg -> per-channel identity + bit-exact + major-sync channel-assignment bits parsed in Python
+- `build_truehd_command()`: forces `-ch_layout/-sample_fmt/-ar` (prevents silent downmix), `-strict:a:N experimental`, `-bsf:a:N side_data=remove=skip_samples` (see below)
+- `create_channel_test_file()`: speaker-identification MKV for checking on a receiver
+
+**truehd_workflow.py** - `TrueHDConverter.convert()`: validate source -> disk space -> hidden temp in source dir -> (clip: stream-copy cut first) -> encode -> `_verify_output()` checks -> optional `_strict_compare()` (streams both decodes as s32le and compares) -> rename to `_Sound_TrueHD.mkv` or leave for GUI-confirmed `finalize_replace()`
+
+**app_settings.py** - JSON settings in %APPDATA%/DTS2DD (or `DTS2DD_SETTINGS_DIR`); stores `truehd_encoder_path`
 
 **audio_stream_info.py** - Data model
-- Simple `AudioStreamInfo` dataclass holding stream metadata
-- Used throughout app for displaying detected audio information
+- `AudioStreamInfo` dataclass; original 5 fields + optional structured fields (layout, sample_fmt, bit depth, title, dispositions)
+- `__str__` keeps the legacy format when only text probing was available
 
 ### Threading Model
 
@@ -39,7 +52,7 @@ All long-running operations run in background daemon threads to keep GUI respons
 - Audio stream detection when file selected
 - Conversion process during encoding
 
-Main thread uses `root.after()` to safely update GUI from worker threads.
+Main thread uses `root.after()` to safely update GUI from worker threads. Never touch widgets or `messagebox` from a worker - use `self._ui(func, *args)`.
 
 ### Key Design Decisions
 
@@ -47,11 +60,24 @@ Main thread uses `root.after()` to safely update GUI from worker threads.
 
 2. **Recursive FFmpeg Search**: Extracted archives may nest FFmpeg in subdirectories; `rglob()` finds it regardless of nesting depth.
 
-3. **Subprocess.run() for Conversion**: Simpler than Popen with threading. Provides proper file buffering so output file grows during conversion.
+3. **Popen + `-progress pipe:1`**: `run_ffmpeg()` parses progress from stdout while a thread drains stderr, so errors can be shown and jobs cancelled.
 
 4. **Codec Selection**: E-AC-3 (eac3) supports higher bitrates (up to 768k) for better quality preservation when converting from high-bitrate DTS sources.
 
 5. **Activity Log**: Real-time logging in GUI shows all operations and progress, helping users understand what's happening.
+
+### TrueHD findings (verified Nov 2026, LibreMPEG master 2f18174)
+
+- Standard FFmpeg's truehd encoder only supports up to 5.1(side). LibreMPEG adds 7.1 etc.
+- Only `5.1(side)` and `7.1` are allowed (`SUPPORTED_LAYOUTS`). 6.1 encodes but is NOT bit-exact; 5.1(back) signals no surrounds in the 6ch presentation; `7.1(wide)` is unsupported and FFmpeg silently downmixes it to 5.1 unless the output layout is forced.
+- DTS decoder output `s16p/s32p` = lossless XLL decode; `fltp` = lossy core only -> refuse.
+- LibreMPEG tags the short final access unit with discard_padding although it already coded only the real samples; in MKV that drops up to 39 real samples. Fixed with the `side_data` bsf (upstream FFmpeg lacks this bsf, so it fails the self-test).
+- Seeking (`-ss`) and encoding in one pass gave the TrueHD track a ~250 ms late start. Test clips are therefore cut by stream copy first, then converted like a whole file.
+- The 2ch/6ch embedded presentations are channel subsets, not downmixes.
+
+### Tests
+
+`python tests/fetch_samples.py` then `DTS2DD_LIBREMPEG=... python -m pytest tests`. Unit tests (`tests/test_unit.py`) need nothing; integration tests skip without tools/samples. Hardware (Plex/Fire TV/AVR) testing is manual - USER_GUIDE.md.
 
 ## Building for Distribution
 
@@ -120,11 +146,11 @@ ffmpeg -i input.mkv -c:v copy -c:a eac3 -b:a 640k output.mkv -y
 
 ## Known Limitations & Workarounds
 
-1. **No Real-time Progress Percentage**: FFmpeg's output capture introduces complexity. Current implementation shows "Encoding in progress..." then "100%" on completion. To add percentage, would need proper Duration parsing and out_time_ms tracking.
+1. **Progress Percentage**: TrueHD shows percentage/speed/ETA from `run_ffmpeg()`. The AC-3/E-AC-3 path still shows an indeterminate bar (it does not pass a duration).
 
 2. **Nested FFmpeg Directories**: Windows ZIP extraction creates nested folders. Handled by `rglob()` search in `get_ffmpeg_path()`.
 
-3. **Single Audio Stream**: App converts only one audio stream. To preserve multiple streams, would need to detect all audio streams and handle muxing separately.
+3. **Single Audio Stream**: App converts one audio stream per run; all other streams are copied.
 
 4. **No Drag-and-Drop**: tkinterdnd2 would be required. Current browse button is sufficient.
 
@@ -153,8 +179,13 @@ ffmpeg -i input.mkv -c:v copy -c:a eac3 -b:a 640k output.mkv -y
 ```
 converter.py              # GUI application
 ffmpeg_downloader.py      # FFmpeg auto-setup
-ffmpeg_helper.py          # FFmpeg integration
+ffmpeg_helper.py          # FFmpeg integration (shared)
+media_probe.py            # ffprobe JSON + verification helpers
+truehd_encoder.py         # LibreMPEG TrueHD backend + self-test
+truehd_workflow.py        # TrueHD conversion/verification workflow
+app_settings.py           # Persistent settings
 audio_stream_info.py      # Data model
+tests/                    # unit + integration tests, fetch_samples.py
 create_icon.py            # Icon generator
 converter.spec            # PyInstaller config
 build_macos.sh            # macOS build script

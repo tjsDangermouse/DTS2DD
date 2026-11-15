@@ -39,8 +39,19 @@ echo 4. Building Windows executable (64-bit)...
 python -m PyInstaller --clean converter.spec
 
 echo.
+if exist "librempeg\ffmpeg.exe" (
+    echo 5. Copying LibreMPEG TrueHD encoder into dist\librempeg ...
+    if not exist "dist\librempeg" mkdir "dist\librempeg"
+    copy /y "librempeg\*.*" "dist\librempeg\" >nul
+    echo    Remember: LibreMPEG built with --enable-agpl is AGPL v3+.
+    echo    Ship its source/commit and COPYING.AGPLv3 with it.
+) else (
+    echo 5. No librempeg\ffmpeg.exe found - TrueHD users select LibreMPEG in the app.
+)
+
+echo.
 if exist "dist\DTS to AC-3 Converter.exe" (
-    echo 4. Build complete!
+    echo Build complete!
     echo.
     echo Output: dist\DTS to AC-3 Converter.exe
     echo.
