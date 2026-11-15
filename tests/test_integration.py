@@ -4,6 +4,7 @@ Requires LibreMPEG (DTS2DD_LIBREMPEG), standard FFmpeg + ffprobe, and the
 FATE samples (python tests/fetch_samples.py). Tests skip when unavailable.
 These do NOT test Plex, Fire TV or AV-receiver behaviour - see USER_GUIDE.md.
 """
+import hashlib
 import os
 import shutil
 import subprocess
@@ -228,7 +229,9 @@ class TrueHDWorkflowTests(Workdir):
                      "-frames:a", "497", clip])
         result = self.converter().convert(str(clip), 0, tw.TrueHDOptions())
         self.assertTrue(result.lossless, result.lossless_detail)
-        self.assertIn("254,464 samples", result.lossless_detail)
+        decoded = subprocess.run([FFMPEG, "-v", "error", "-i", result.final_path, "-map", "0:a:1",
+                                  "-c:a", "pcm_s32le", "-f", "s32le", "-"], capture_output=True).stdout
+        self.assertEqual(len(decoded) // 32, 254464)    # 497 DTS frames x 512, none dropped
 
     def test_replace_original_requires_confirmation_step(self):
         source = self.copy(self.fixture71)
@@ -283,12 +286,47 @@ class TrueHDWorkflowTests(Workdir):
         source = self.copy(self.fixture71)
 
         def copy_only(cmd, **kw):
-            shutil.copyfile(source, cmd[-1])
+            shutil.copyfile(source, cmd[cmd.index("-y") + 1])   # the MKV output
             return FFmpegResult(0, [])
 
         with self.assertRaises(te.TrueHDError) as ctx:
             self.convert(source, runner=copy_only)
         self.assertIn("verification failed", str(ctx.exception))
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["Spectre.mkv"])
+
+    def test_strict_uses_fingerprint_and_independent_decoder(self):
+        """The source fingerprint is made during encoding and matches a full decode."""
+        source = self.copy(self.fixture71)
+        logs = []
+        conv = tw.TrueHDConverter(LIBRE, FFPROBE, FFMPEG, encoder_report(), log=logs.append)
+        result = conv.convert(str(source), 1, tw.TrueHDOptions())
+        self.assertTrue(result.lossless, result.lossless_detail)
+        self.assertIn("SHA-256 of all decoded samples identical", result.lossless_detail)
+        digest = next(l.split()[-1] for l in logs if l.strip().startswith("SHA256") or l.strip().startswith("SHA-256 "))
+        full = subprocess.run([FFMPEG, "-v", "error", "-i", source, "-map", "0:1", "-c:a", "pcm_s32le",
+                               "-f", "s32le", "-"], capture_output=True).stdout
+        self.assertEqual(digest, hashlib.sha256(full).hexdigest())
+        # the verification decode must not read the source film again
+        verify_cmds = [l for l in logs if l.startswith("Command:") and "output.sha256" in l]
+        self.assertTrue(verify_cmds and all(str(source) not in c for c in verify_cmds))
+
+    def test_fingerprint_mismatch_fails_and_locates(self):
+        """A wrong source fingerprint fails verification and reports where it differs."""
+        source = self.copy(self.fixture71)
+        real_encode = tw.TrueHDConverter._encode
+
+        def encode_then_corrupt(conv, job, total, source_hash_path=None):
+            real_encode(conv, job, total, source_hash_path)
+            with open(source_hash_path, "w") as f:
+                f.write("SHA256=" + "0" * 64 + "\n")
+
+        with mock.patch.object(tw.TrueHDConverter, "_encode", encode_then_corrupt), \
+                mock.patch.object(tw.TrueHDConverter, "_locate_difference",
+                                  autospec=True, side_effect=lambda *a: None) as locate:
+            with self.assertRaises(te.TrueHDError) as ctx:
+                self.converter().convert(str(source), 1, tw.TrueHDOptions())
+        locate.assert_called_once()
+        self.assertIn("Lossless verification failed", str(ctx.exception))
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["Spectre.mkv"])
 
     def test_cancel_removes_temp(self):

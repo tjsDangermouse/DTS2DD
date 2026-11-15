@@ -26,8 +26,8 @@ from media_probe import (
 from truehd_encoder import (
     LAYOUT_LABELS, LOSSLESS_SAMPLE_FORMATS, SAMPLE_RATES_BY_CHANNELS, SUPPORTED_LAYOUTS,
     EncoderReport, TrueHDError, TrueHDJob, build_clip_cut_command, build_output_decode_command,
-    build_source_decode_command, build_truehd_command, check_channel_assignment,
-    read_major_sync,
+    build_output_hash_command, build_source_decode_command, build_truehd_command,
+    check_channel_assignment, read_hash_file, read_major_sync,
 )
 
 PARTIAL_PREFIX = ".{stem}.truehd-partial-"
@@ -264,6 +264,11 @@ class TrueHDConverter:
             make_default=options.make_default,
         )
 
+        # Strict verification fingerprints (small files in the system temp folder)
+        hash_dir = tempfile.mkdtemp(prefix="dts2dd-verify-") if options.strict_verify else None
+        source_hash = os.path.join(hash_dir, "source.sha256") if hash_dir else None
+        output_hash = os.path.join(hash_dir, "output.sha256") if hash_dir else None
+
         result = TrueHDResult(source_path, temp_path, None, clip=bool(clip_seconds))
         keep_temp = False
         try:
@@ -278,7 +283,7 @@ class TrueHDConverter:
                 reference_probe = run_ffprobe(self.ffprobe, cut_path)
                 duration = format_duration(reference_probe) or float(clip_seconds)
             # Step 2: append the TrueHD track (whole film, or the cut clip).
-            self._encode(job, duration)
+            self._encode(job, duration, source_hash)
             self._verify_output(job, stream, reference_probe, result,
                                 original_path=source_path, clip_start=clip_start)
             if not result.passed:
@@ -286,7 +291,7 @@ class TrueHDConverter:
                 raise TrueHDError("Output verification failed - the source was not changed:\n"
                                   + "\n".join(f"  {c.name}: {c.detail}" for c in failed))
             if options.strict_verify:
-                self._strict_compare(job, stream, duration, result)
+                self._strict_compare(job, stream, duration, result, source_hash, output_hash)
                 if not result.lossless:
                     raise TrueHDError("Lossless verification failed - the source was not "
                                       f"changed:\n{result.lossless_detail}")
@@ -304,6 +309,8 @@ class TrueHDConverter:
                 os.unlink(temp_path)
             if cut_path and os.path.exists(cut_path):
                 os.unlink(cut_path)
+            if hash_dir:
+                shutil.rmtree(hash_dir, ignore_errors=True)
 
     def _make_temp(self, source: Path) -> str:
         """Hidden temporary MKV beside the source (never the source itself)."""
@@ -380,7 +387,8 @@ class TrueHDConverter:
         self.log(f"  Strict lossless verification: {'Yes' if options.strict_verify else 'No'}")
         self.log("========================================")
 
-    def _run(self, phase: str, cmd: List[str], total_seconds: Optional[float], failure: str) -> None:
+    def _run(self, phase: str, cmd: List[str], total_seconds: Optional[float], failure: str,
+             output: Optional[str] = None) -> None:
         self.log("Command: " + " ".join(_quote(c) for c in cmd))
         self.progress(phase, 0.0, "")
 
@@ -394,15 +402,16 @@ class TrueHDConverter:
 
         result = self.runner(cmd, total_seconds=total_seconds, on_progress=on_progress,
                              handle=self.handle)
-        output = cmd[-1]
+        output = output or cmd[-1]
         if result.returncode != 0:
             raise TrueHDError(f"{failure} - the source was not changed.\n\n" + result.error_summary())
         if not os.path.exists(output) or os.path.getsize(output) == 0:
             raise TrueHDError(f"{failure}: no output was produced - the source was not changed.")
 
-    def _encode(self, job: TrueHDJob, total_seconds: Optional[float]) -> None:
-        self._run("Encoding TrueHD", build_truehd_command(self.encoder, job), total_seconds,
-                  "TrueHD encoding failed")
+    def _encode(self, job: TrueHDJob, total_seconds: Optional[float],
+                source_hash_path: Optional[str] = None) -> None:
+        self._run("Encoding TrueHD", build_truehd_command(self.encoder, job, source_hash_path),
+                  total_seconds, "TrueHD encoding failed", output=job.output_path)
         self.log("Encoding finished; verifying output...")
 
     def _verify_output(self, job: TrueHDJob, stream: AudioStreamInfo,
@@ -525,13 +534,60 @@ class TrueHDConverter:
             self.log(f"  {'✓' if c.passed else '✗'} {c.name}: {c.detail}")
 
     def _strict_compare(self, job: TrueHDJob, stream: AudioStreamInfo,
-                        total_seconds: Optional[float], result: TrueHDResult) -> None:
-        """Decode source and TrueHD output to integer PCM and compare every sample."""
-        channels = stream.channel_count
-        self.log("Strict lossless verification: decoding source (DTS-HD MA XLL) and "
-                 "TrueHD output to 32-bit integer PCM...")
+                        total_seconds: Optional[float], result: TrueHDResult,
+                        source_hash_path: Optional[str], output_hash_path: Optional[str]) -> None:
+        """Prove every decoded sample of the new TrueHD track equals the source.
+
+        The SHA-256 of the decoded source PCM (exactly what the encoder was
+        given) was written during the encode pass. Here the TrueHD track is
+        decoded from the finished MKV by the independent FFmpeg build and
+        hashed the same way. Only the output file is read; the source film is
+        not read again. On a mismatch the slow sample-by-sample comparison is
+        run to report where the first difference is.
+        """
         decoder_name = "independent FFmpeg" if self.reference != self.encoder else "encoder build"
+        self.log("Strict lossless verification: decoding the TrueHD track from the new MKV "
+                 "and comparing its SHA-256 with the source audio's...")
         self.log(f"  TrueHD decoded by: {decoder_name} ({self.reference})")
+
+        source_digest = read_hash_file(source_hash_path) if source_hash_path else None
+        if not source_digest:
+            result.lossless = False
+            result.lossless_detail = "the source audio fingerprint was not produced during encoding"
+            self.log(f"  ✗ Lossless comparison: {result.lossless_detail}")
+            return
+
+        self._run("Verifying lossless audio",
+                  build_output_hash_command(self.reference, job.output_path,
+                                            job.new_audio_index, output_hash_path),
+                  total_seconds, "Lossless verification could not decode the TrueHD track")
+        output_digest = read_hash_file(output_hash_path)
+        bits = stream.bit_depth or 24
+
+        if output_digest == source_digest:
+            result.lossless = True
+            result.lossless_detail = (
+                f"SHA-256 of all decoded samples identical "
+                f"({format_seconds(total_seconds)} of {stream.channel_count}-channel audio, "
+                f"{bits}-bit integer PCM; TrueHD decoded by {decoder_name})")
+            self.log(f"  ✓ Lossless comparison: {result.lossless_detail}")
+            self.log(f"    SHA-256 {source_digest}")
+            return
+
+        self.log(f"  ✗ Fingerprints differ (source {source_digest}, TrueHD {output_digest}); "
+                 "locating the first difference...")
+        self._locate_difference(job, stream, total_seconds, result)
+        if result.lossless:
+            # Should be impossible: hashes differ but samples match.
+            result.lossless = False
+            result.lossless_detail = ("the audio fingerprints differ, although a sample comparison "
+                                      "found no difference")
+
+    def _locate_difference(self, job: TrueHDJob, stream: AudioStreamInfo,
+                           total_seconds: Optional[float], result: TrueHDResult) -> None:
+        """Slow path: decode source and TrueHD output side by side and find the
+        first differing sample (only used after a fingerprint mismatch)."""
+        channels = stream.channel_count
         src_cmd = build_source_decode_command(self.encoder, job)
         out_cmd = build_output_decode_command(self.reference, job.output_path, job.new_audio_index)
 
@@ -562,7 +618,7 @@ class TrueHDConverter:
                     elapsed = time.monotonic() - started
                     fraction = min(1.0, compared / expected_bytes)
                     eta = elapsed * (1 - fraction) / fraction if fraction > 0.001 else None
-                    self.progress("Verifying lossless audio", fraction,
+                    self.progress("Locating the difference", fraction,
                                   f"{format_seconds(elapsed)} elapsed"
                                   + (f" • ~{format_seconds(eta)} remaining" if eta is not None else ""))
             codes = []

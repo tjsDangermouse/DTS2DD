@@ -193,9 +193,12 @@ Conversion is only possible after the self-test passes for the source's layout.
      is kept and TrueHD is added after it.
    - **Make converted audio the default track** - off. When on, the TrueHD
      track becomes the only default audio track.
-   - **Strict lossless verification** - on. Decodes the original and the new
-     track and compares every sample. Roughly doubles the time; recommended
-     until you trust the setup.
+   - **Strict lossless verification** - on. While encoding, the app takes a
+     fingerprint (SHA-256) of the original audio exactly as it went into the
+     encoder. Afterwards a separate copy of FFmpeg decodes the new TrueHD
+     track from the saved MKV and fingerprints it the same way; they must
+     match, which proves every sample of every channel is identical. This
+     re-reads the new file once (the original is not read again).
    - **Output** - *Save as new MKV* (default) writes `Film_Sound_TrueHD.mkv`
      beside the original. *Replace original after verification* asks for
      confirmation only after every check has passed.
@@ -289,8 +292,9 @@ Denon is **unverified**.
   samples (under 1 ms) of the stream as padding, which would make players drop
   real audio at the very end. The app removes that marker and verifies every
   sample is kept.
-- Verifying a whole film takes time: expect roughly the length of the
-  encode again for strict verification.
+- Strict verification reads the whole new MKV once more, so on a slow drive
+  or network share it can still take a while - roughly the time it takes to
+  read the file, and less than the encode itself.
 - Size: in testing, LibreMPEG's TrueHD was about 1.3x the size of the
   DTS-HD MA track it came from. For Spectre (DTS-HD MA ~4.7 Mb/s, 2 h 28 min)
   expect the new file to be roughly 7 GB larger if the original track is kept
