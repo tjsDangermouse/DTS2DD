@@ -38,7 +38,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: vendor/librempeg
-          key: librempeg-win64-${{ env.LIBREMPEG_COMMIT }}-v1
+          key: librempeg-win64-${{ env.LIBREMPEG_COMMIT }}-${{ hashFiles('installer/patches/*.patch') }}-zlib-v2
 
       - name: Set up MSYS2
         if: steps.librempeg-cache.outputs.cache-hit != 'true'
@@ -49,6 +49,7 @@ jobs:
           install: >-
             git make diffutils
             mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-zlib
 
       - name: Build LibreMPEG
         if: steps.librempeg-cache.outputs.cache-hit != 'true'
@@ -59,7 +60,11 @@ jobs:
           git clone --filter=blob:none https://github.com/librempeg/librempeg.git src-librempeg
           cd src-librempeg
           git checkout "$LIBREMPEG_COMMIT"
-          ./configure --enable-agpl --disable-doc --disable-network --disable-autodetect \
+          # DTS2DD patch: configurable TrueHD peak data rate (fixes receiver glitches)
+          for p in ../installer/patches/*.patch; do git apply --verbose "$p"; done
+          # zlib is required: Blu-ray PGS subtitles in MKV are usually zlib-compressed,
+          # and without it they are copied corrupted.
+          ./configure --enable-agpl --enable-zlib --disable-doc --disable-network --disable-autodetect \
                       --disable-ffplay --disable-shared --enable-static \
                       --extra-ldflags=-static --pkg-config-flags=--static
           make -j"$(nproc)"
@@ -70,8 +75,12 @@ jobs:
           ./ffmpeg.exe -hide_banner -h encoder=truehd | tee ../truehd-encoder.txt
           grep -q " 7.1" ../truehd-encoder.txt
           ./ffmpeg.exe -hide_banner -h bsf=side_data > /dev/null
+          grep -q -- "-peak_bitrate" ../truehd-encoder.txt
+          ./ffmpeg.exe -hide_banner -h decoder=zlib > ../zlib-decoder.txt
+          grep -q "^Decoder zlib" ../zlib-decoder.txt
           mkdir -p ../vendor/librempeg
           cp ffmpeg.exe ffprobe.exe COPYING.AGPLv3 COPYING.GPLv3 LICENSE.md ../vendor/librempeg/
+          cp ../installer/patches/*.patch ../vendor/librempeg/
           echo "$LIBREMPEG_COMMIT" > ../vendor/librempeg/SOURCE_COMMIT.txt
 
       - name: Save LibreMPEG build
@@ -79,7 +88,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: vendor/librempeg
-          key: librempeg-win64-${{ env.LIBREMPEG_COMMIT }}-v1
+          key: librempeg-win64-${{ env.LIBREMPEG_COMMIT }}-${{ hashFiles('installer/patches/*.patch') }}-zlib-v2
 
       # ------------------------------------------------------------------- FFmpeg
       - name: Download FFmpeg (checksum verified)
@@ -134,7 +143,8 @@ jobs:
           Copy-Item vendor/ffmpeg/SOURCE.txt "$app/licenses/FFmpeg-SOURCE.txt"
           Copy-Item vendor/librempeg/COPYING.AGPLv3 "$app/licenses/LibreMPEG-COPYING.AGPLv3.txt"
           Copy-Item vendor/librempeg/LICENSE.md "$app/licenses/LibreMPEG-LICENSE.md"
-          "https://github.com/librempeg/librempeg/tree/$env:LIBREMPEG_COMMIT" | Out-File "$app/licenses/LibreMPEG-SOURCE.txt" -Encoding utf8
+          "https://github.com/librempeg/librempeg/tree/$env:LIBREMPEG_COMMIT with the patch(es) in this folder applied" | Out-File "$app/licenses/LibreMPEG-SOURCE.txt" -Encoding utf8
+          Copy-Item vendor/librempeg/*.patch "$app/licenses/"
           Copy-Item installer/THIRD_PARTY_NOTICES.txt "$app/licenses/"
 
       - name: Self-test the packaged app

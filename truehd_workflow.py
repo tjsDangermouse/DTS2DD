@@ -21,18 +21,19 @@ from ffmpeg_helper import ConversionCancelled, FFmpegProgress, ProcessHandle, ru
 from media_probe import (
     audio_streams_from_probe, classify_audio, describe_video, format_duration,
     format_seconds, is_lossless_dts_hd_ma, keyframe_at_or_before, run_ffprobe,
-    streams_of_type, subprocess_flags, tag, video_packet_hashes, video_signature,
+    stream_packet_hashes, streams_of_type, subprocess_flags, tag, video_signature,
 )
 from truehd_encoder import (
     LAYOUT_LABELS, LOSSLESS_SAMPLE_FORMATS, SAMPLE_RATES_BY_CHANNELS, SUPPORTED_LAYOUTS,
     EncoderReport, TrueHDError, TrueHDJob, build_clip_cut_command, build_output_decode_command,
     build_output_hash_command, build_source_decode_command, build_truehd_command,
-    check_channel_assignment, read_hash_file, read_major_sync,
+    check_access_unit_sizes, check_channel_assignment, read_hash_file, read_major_sync,
 )
 
 PARTIAL_PREFIX = ".{stem}.truehd-partial-"
 OUTPUT_SUFFIX = "_Sound_TrueHD"
-VIDEO_HASH_PACKETS = 300
+# Copied tracks are compared packet-by-packet over this much of the film.
+PACKET_CHECK_SECONDS = 300.0
 
 
 # --------------------------------------------------------------------------
@@ -265,9 +266,11 @@ class TrueHDConverter:
         )
 
         # Strict verification fingerprints (small files in the system temp folder)
-        hash_dir = tempfile.mkdtemp(prefix="dts2dd-verify-") if options.strict_verify else None
-        source_hash = os.path.join(hash_dir, "source.sha256") if hash_dir else None
-        output_hash = os.path.join(hash_dir, "output.sha256") if hash_dir else None
+        # Small working files (fingerprints, packet sizes) in the system temp folder
+        work_dir = tempfile.mkdtemp(prefix="dts2dd-verify-")
+        source_hash = os.path.join(work_dir, "source.sha256") if options.strict_verify else None
+        output_hash = os.path.join(work_dir, "output.sha256")
+        packet_sizes = os.path.join(work_dir, "truehd-packet-sizes.txt")
 
         result = TrueHDResult(source_path, temp_path, None, clip=bool(clip_seconds))
         keep_temp = False
@@ -283,9 +286,10 @@ class TrueHDConverter:
                 reference_probe = run_ffprobe(self.ffprobe, cut_path)
                 duration = format_duration(reference_probe) or float(clip_seconds)
             # Step 2: append the TrueHD track (whole film, or the cut clip).
-            self._encode(job, duration, source_hash)
+            self._encode(job, duration, source_hash, packet_sizes)
             self._verify_output(job, stream, reference_probe, result,
-                                original_path=source_path, clip_start=clip_start)
+                                original_path=source_path, clip_start=clip_start,
+                                packet_sizes_path=packet_sizes)
             if not result.passed:
                 failed = [c for c in result.checks if not c.passed]
                 raise TrueHDError("Output verification failed - the source was not changed:\n"
@@ -309,8 +313,7 @@ class TrueHDConverter:
                 os.unlink(temp_path)
             if cut_path and os.path.exists(cut_path):
                 os.unlink(cut_path)
-            if hash_dir:
-                shutil.rmtree(hash_dir, ignore_errors=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     def _make_temp(self, source: Path) -> str:
         """Hidden temporary MKV beside the source (never the source itself)."""
@@ -409,14 +412,17 @@ class TrueHDConverter:
             raise TrueHDError(f"{failure}: no output was produced - the source was not changed.")
 
     def _encode(self, job: TrueHDJob, total_seconds: Optional[float],
-                source_hash_path: Optional[str] = None) -> None:
-        self._run("Encoding TrueHD", build_truehd_command(self.encoder, job, source_hash_path),
+                source_hash_path: Optional[str] = None,
+                packet_sizes_path: Optional[str] = None) -> None:
+        self._run("Encoding TrueHD",
+                  build_truehd_command(self.encoder, job, source_hash_path, packet_sizes_path),
                   total_seconds, "TrueHD encoding failed", output=job.output_path)
         self.log("Encoding finished; verifying output...")
 
     def _verify_output(self, job: TrueHDJob, stream: AudioStreamInfo,
                        source_probe: Dict, result: TrueHDResult,
-                       original_path: str, clip_start: Optional[float] = None) -> None:
+                       original_path: str, clip_start: Optional[float] = None,
+                       packet_sizes_path: Optional[str] = None) -> None:
         """Check the output against ``source_probe`` (the film, or the cut clip)."""
         clip = clip_start is not None
         self.progress("Verifying output", None, "streams and metadata")
@@ -450,9 +456,18 @@ class TrueHDConverter:
             checks.append(Check("Track language", tag(new, "language") == stream.language,
                                 tag(new, "language") or "none"))
 
-        sync_error = check_channel_assignment(job.layout, read_major_sync(self.encoder, job.output_path, k))
+        sync = read_major_sync(self.encoder, job.output_path, k)
+        sync_error = check_channel_assignment(job.layout, sync)
         checks.append(Check("TrueHD speaker assignment (bitstream)", sync_error is None,
                             sync_error or "matches source layout"))
+
+        # Every access unit must fit the peak data rate declared in the header,
+        # or hardware decoders (AV receivers) can glitch at loud passages.
+        if sync and packet_sizes_path:
+            rate_error, rate_summary = check_access_unit_sizes(
+                packet_sizes_path, sync.peak_bitrate, stream.sample_rate)
+            checks.append(Check("TrueHD data rate within declared peak", rate_error is None,
+                                rate_error or rate_summary))
 
         # A/V sync: the new track must start at the same time as its source
         # track (the strict comparison then proves sample 0 lines up).
@@ -512,18 +527,8 @@ class TrueHDConverter:
             diff = [key for key in sig_before if sig_before[key] != sig_after.get(key)]
             checks.append(Check(f"Video {i + 1} format/HDR/Dolby Vision metadata", not diff,
                                 describe_video(after) if not diff else f"changed: {', '.join(diff)}"))
-            self.progress("Verifying output", None, "comparing video packets")
-            try:
-                # Compare against the ORIGINAL film (at the clip start for clips).
-                src_hashes = video_packet_hashes(self.encoder, original_path, i, VIDEO_HASH_PACKETS,
-                                                 clip_start if clip else None)
-                out_hashes = video_packet_hashes(self.encoder, job.output_path, i, VIDEO_HASH_PACKETS)
-                n = min(len(src_hashes), len(out_hashes))
-                same = n > 0 and src_hashes[:n] == out_hashes[:n]
-                checks.append(Check(f"Video {i + 1} packet payloads identical", same,
-                                    f"first {n} packets compared"))
-            except (RuntimeError, subprocess.TimeoutExpired) as e:
-                checks.append(Check(f"Video {i + 1} packet payloads identical", False, str(e)))
+
+        self._check_copied_packets(job, source_probe, out, original_path, clip_start, checks)
 
         out_duration, expected = format_duration(out), format_duration(source_probe)
         if out_duration and expected:
@@ -532,6 +537,71 @@ class TrueHDConverter:
 
         for c in checks:
             self.log(f"  {'✓' if c.passed else '✗'} {c.name}: {c.detail}")
+
+    def _check_copied_packets(self, job: TrueHDJob, source_probe: Dict, out: Dict,
+                              original_path: str, clip_start: Optional[float],
+                              checks: List["Check"]) -> None:
+        """Every copied track (video, other audio, subtitles) must contain the
+        same packet payloads as the original.
+
+        Both files are read by the independent standard FFmpeg, which has zlib,
+        so a track the encoder build mis-read (e.g. zlib-compressed PGS
+        subtitles) shows up as a difference. Covers the first
+        PACKET_CHECK_SECONDS of the film, or the whole test clip.
+        """
+        self.progress("Verifying output", None, "comparing copied tracks with the original")
+        new_index = streams_of_type(out, "audio")[job.new_audio_index]["index"]
+        src_streams = [st for st in source_probe.get("streams", [])
+                       if st.get("codec_type") not in ("attachment", None)
+                       and not (job.remove_source and st["index"] == job.source_stream_index)]
+        out_streams = [st for st in out.get("streams", [])
+                       if st.get("codec_type") not in ("attachment", None) and st["index"] != new_index]
+        if len(src_streams) != len(out_streams):
+            checks.append(Check("Copied tracks identical to original", False,
+                                f"{len(out_streams)} copied tracks, expected {len(src_streams)}"))
+            return
+        clip = clip_start is not None
+        try:
+            src = stream_packet_hashes(self.reference, original_path, [st["index"] for st in src_streams],
+                                       PACKET_CHECK_SECONDS, clip_start if clip else None)
+            dst = stream_packet_hashes(self.reference, job.output_path, [st["index"] for st in out_streams],
+                                       PACKET_CHECK_SECONDS)
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+            checks.append(Check("Copied tracks identical to original", False, str(e)))
+            return
+
+        problems, compared = [], 0
+        for before, after in zip(src_streams, out_streams):
+            # Packets near the end of a time-limited read can be included or
+            # dropped differently (reordered video frames), so ignore the last
+            # 2 seconds of the new file's window; compare payloads only.
+            O_full = dst[after["index"]]
+            if O_full:
+                end = max(p[2] for p in O_full) - 2.0
+                O_full = [p for p in O_full if p[2] <= end] or O_full[:1]
+            S = [(p[0], p[1]) for p in src[before["index"]]]
+            O = [(p[0], p[1]) for p in O_full]
+            label = f"{before.get('codec_type')} #{before['index']} ({before.get('codec_name')}" + (
+                f", {tag(before, 'language')})" if tag(before, "language") else ")")
+            if not O:
+                if S and not clip:
+                    problems.append(f"{label}: no packets in the new file")
+                continue
+            try:
+                start = S.index(O[0])
+            except ValueError:
+                problems.append(f"{label}: packets differ from the original")
+                continue
+            n = min(len(O), len(S) - start)
+            if (not clip and start != 0) or S[start:start + n] != O[:n]:
+                problems.append(f"{label}: packets differ from the original")
+                continue
+            compared += n
+        window = "the whole clip" if clip else f"the first {int(PACKET_CHECK_SECONDS // 60)} minutes"
+        checks.append(Check("Copied tracks identical to original", not problems,
+                            "; ".join(problems[:4]) + (" ..." if len(problems) > 4 else "") if problems
+                            else f"{len(out_streams)} tracks, {compared:,} packets byte-identical over {window} "
+                                 "(read by independent FFmpeg)"))
 
     def _strict_compare(self, job: TrueHDJob, stream: AudioStreamInfo,
                         total_seconds: Optional[float], result: TrueHDResult,

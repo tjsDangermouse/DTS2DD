@@ -16,6 +16,7 @@ executable works: every candidate is
 Only layouts that pass the self-test can be converted.
 """
 import array
+import hashlib
 import math
 import os
 import platform
@@ -25,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -88,6 +90,26 @@ EXPECTED_CHANNEL_ASSIGNMENT = {
 # that packet side data keeps every sample (verified by the self-test and the
 # strict comparison).
 END_PADDING_FIX = "side_data=remove=skip_samples"
+
+# Peak data rate written into every TrueHD header. LibreMPEG gives every
+# access unit the same input timing, so a hardware decoder expects each one to
+# arrive within its own 1/1200 s at no more than this rate. With LibreMPEG's
+# default of 9.6 Mb/s, loud passages (e.g. Spectre at 0:34.5) produce access
+# units just over 1000 bytes and real Dolby decoders glitch. 18 Mb/s is the
+# TrueHD/Blu-ray maximum and allows 1875-byte access units. Requires the
+# peak_bitrate option added by installer/patches/librempeg-truehd-peak-bitrate.patch.
+TRUEHD_PEAK_BITRATE = 18_000_000
+
+
+def max_access_unit_bytes(peak_bitrate: int, sample_rate: int) -> float:
+    """Largest access unit that fits the declared peak rate.
+
+    An access unit is 40 samples at 44.1/48 kHz (80 at 88.2/96, 160 at
+    176.4/192), i.e. always 40/44100 or 40/48000 seconds.
+    """
+    base = 44100 if sample_rate % 44100 == 0 else 48000
+    return peak_bitrate * 40 / base / 8
+
 
 STATUS_READY = "TrueHD encoder ready"
 STATUS_MISSING = "TrueHD encoder missing"
@@ -172,8 +194,20 @@ class AdvertisedCapabilities:
     sample_formats: List[str] = field(default_factory=list)
     sample_rates: List[int] = field(default_factory=list)
     experimental: bool = False
+    has_peak_option: bool = False   # patched LibreMPEG: -peak_bitrate
+    has_zlib: bool = False          # needed to copy zlib-compressed MKV tracks (PGS subtitles)
     version: str = ""
     error: str = ""
+
+    def missing_features(self) -> List[str]:
+        missing = []
+        if not self.has_peak_option:
+            missing.append("it lacks the TrueHD peak data rate fix (peak_bitrate option), so loud "
+                           "passages can glitch on AV receivers")
+        if not self.has_zlib:
+            missing.append("it was built without zlib, so compressed subtitle tracks would be "
+                           "corrupted when copied")
+        return missing
 
 
 def parse_encoder_help(text: str) -> AdvertisedCapabilities:
@@ -182,6 +216,7 @@ def parse_encoder_help(text: str) -> AdvertisedCapabilities:
     if not re.search(r"^Encoder truehd", text, re.MULTILINE):
         return caps
     caps.has_encoder = True
+    caps.has_peak_option = bool(re.search(r"^\s*-peak_bitrate\b", text, re.MULTILINE))
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("General capabilities:"):
@@ -211,8 +246,60 @@ def query_capabilities(path: str) -> AdvertisedCapabilities:
         caps.error = f"Could not run {path}: {e}"
         return caps
     caps = parse_encoder_help(result.stdout + result.stderr)
+    caps.has_zlib = reads_zlib_compressed_tracks(path)
     caps.version = version[0] if version else ""
     return caps
+
+
+# --------------------------------------------------------------------------
+# zlib check: can the build read zlib-compressed Matroska tracks?
+# --------------------------------------------------------------------------
+# Checking for a "zlib" decoder is not enough: LibreMPEG has built-in inflate
+# for its own codecs even when built without the zlib library, while its
+# Matroska demuxer still cannot unpack compressed tracks. So test it directly.
+
+def _ebml(element_id: bytes, payload: bytes) -> bytes:
+    return element_id + b"\x01" + len(payload).to_bytes(7, "big") + payload
+
+
+def _ebml_uint(element_id: bytes, value: int) -> bytes:
+    return _ebml(element_id, value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big"))
+
+
+def zlib_test_mkv(text: bytes) -> bytes:
+    """A minimal MKV with one zlib-compressed UTF-8 subtitle block."""
+    header = _ebml(b"\x1a\x45\xdf\xa3", _ebml_uint(b"\x42\x86", 1) + _ebml_uint(b"\x42\xf7", 1)
+                   + _ebml_uint(b"\x42\xf2", 4) + _ebml_uint(b"\x42\xf3", 8)
+                   + _ebml(b"\x42\x82", b"matroska") + _ebml_uint(b"\x42\x87", 4)
+                   + _ebml_uint(b"\x42\x85", 2))
+    info = _ebml(b"\x15\x49\xa9\x66", _ebml_uint(b"\x2a\xd7\xb1", 1000000)
+                 + _ebml(b"\x4d\x80", b"DTS2DD") + _ebml(b"\x57\x41", b"DTS2DD"))
+    compression = _ebml(b"\x50\x34", _ebml_uint(b"\x42\x54", 0))          # ContentCompAlgo: zlib
+    encoding = _ebml(b"\x62\x40", _ebml_uint(b"\x50\x31", 0) + _ebml_uint(b"\x50\x32", 1)
+                     + _ebml_uint(b"\x50\x33", 0) + compression)
+    track = _ebml(b"\xae", _ebml_uint(b"\xd7", 1) + _ebml_uint(b"\x73\xc5", 1) + _ebml_uint(b"\x83", 0x11)
+                  + _ebml(b"\x86", b"S_TEXT/UTF8") + _ebml(b"\x6d\x80", encoding))
+    block = b"\x81\x00\x00\x00" + zlib.compress(text)
+    cluster = _ebml(b"\x1f\x43\xb6\x75", _ebml_uint(b"\xe7", 0)
+                    + _ebml(b"\xa0", _ebml(b"\xa1", block) + _ebml_uint(b"\x9b", 1000)))
+    return header + _ebml(b"\x18\x53\x80\x67", info + _ebml(b"\x16\x54\xae\x6b", track) + cluster)
+
+
+def reads_zlib_compressed_tracks(ffmpeg_path: str) -> bool:
+    """True when the build returns the decompressed payload of a zlib track."""
+    text = b"DTS2DD zlib check: compressed Matroska tracks must be readable. " * 4
+    with tempfile.TemporaryDirectory(prefix="dts2dd-zlib-") as workdir:
+        path = os.path.join(workdir, "zlib-test.mkv")
+        with open(path, "wb") as f:
+            f.write(zlib_test_mkv(text))
+        try:
+            result = _run_text([ffmpeg_path, "-hide_banner", "-nostdin", "-v", "error", "-i", path,
+                                "-map", "0", "-c", "copy", "-f", "framemd5", "-"])
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    if result.returncode != 0:
+        return False
+    return hashlib.md5(text).hexdigest() in result.stdout
 
 
 # --------------------------------------------------------------------------
@@ -227,6 +314,7 @@ class MajorSync:
     sample_rate: int
     ch6_assignment: int
     ch8_assignment: int
+    peak_bitrate: int = 0      # bits/s declared in the header
 
     @staticmethod
     def describe(assignment: int) -> str:
@@ -242,7 +330,7 @@ def parse_major_sync(data: bytes) -> Optional[MajorSync]:
     assignment, 2 bits modifier, 13 bits 8-channel assignment.
     """
     pos = data.find(TRUEHD_SYNC)
-    if pos < 0 or len(data) < pos + 12:
+    if pos < 0 or len(data) < pos + 16:
         return None
     bits = int.from_bytes(data[pos + 4:pos + 8], "big")
     rate_code = bits >> 28
@@ -251,7 +339,10 @@ def parse_major_sync(data: bytes) -> Optional[MajorSync]:
     if rate_code == 0xF:
         return None
     sample_rate = (44100 if rate_code & 8 else 48000) << (rate_code & 7)
-    return MajorSync(sample_rate, ch6, ch8)
+    # After signature (16), flags (16), reserved (16): is_vbr (1) + peak_data_rate (15)
+    peak_field = int.from_bytes(data[pos + 14:pos + 16], "big") & 0x7FFF
+    peak_bitrate = (peak_field * sample_rate + 8) >> 4
+    return MajorSync(sample_rate, ch6, ch8, peak_bitrate)
 
 
 def read_major_sync(ffmpeg_path: str, file_path: str, audio_index: int) -> Optional[MajorSync]:
@@ -418,6 +509,7 @@ def encode_test_signal(encoder: str, raw_path: str, layout: str, bits: int,
         "-f", raw_format, "-ar", "48000", "-ch_layout", layout, "-i", raw_path,
         "-map", "0:a", "-c:a", "truehd", "-strict:a:0", "experimental",
         "-ch_layout:a:0", layout, "-sample_fmt:a:0", sample_fmt, "-ar:a:0", "48000",
+        "-peak_bitrate:a:0", str(TRUEHD_PEAK_BITRATE),
         "-bsf:a:0", END_PADDING_FIX,
         "-y", out_path,
     ]
@@ -480,9 +572,15 @@ def run_layout_test(encoder: str, layout: str, bits: int, workdir: str,
         if decoded != pcm:
             return LayoutTest(layout, bits, False, f"{label}: decoded samples are not identical")
 
-    sync_error = check_channel_assignment(layout, read_major_sync(encoder, out_path, 0))
+    sync = read_major_sync(encoder, out_path, 0)
+    sync_error = check_channel_assignment(layout, sync)
     if sync_error:
         return LayoutTest(layout, bits, False, sync_error)
+    # The header stores the rate in steps of sample_rate / 16 (3000 b/s at 48 kHz)
+    if abs(sync.peak_bitrate - TRUEHD_PEAK_BITRATE) > sync.sample_rate // 16 + 1:
+        return LayoutTest(layout, bits, False,
+                          f"header declares {sync.peak_bitrate / 1e6:.2f} Mb/s peak, expected "
+                          f"{TRUEHD_PEAK_BITRATE / 1e6:.0f} Mb/s")
 
     checked = " and ".join("independent FFmpeg" if d != encoder else "encoder build" for d in decoders)
     return LayoutTest(layout, bits, True,
@@ -514,6 +612,8 @@ def check_encoder(
         report.message = f"{Path(path).name} has no TrueHD encoder"
         return report
 
+    missing = caps.missing_features()
+
     if log:
         log(f"Checking TrueHD encoder: {path}")
         if caps.version:
@@ -525,6 +625,9 @@ def check_encoder(
             for bits in (24, 16):
                 if layout not in caps.layouts:
                     report.tests.append(LayoutTest(layout, bits, False, "layout not advertised"))
+                    continue
+                if missing:
+                    report.tests.append(LayoutTest(layout, bits, False, "; ".join(missing)))
                     continue
                 required_fmt = "s32p" if bits == 24 else "s16p"
                 if required_fmt not in caps.sample_formats:
@@ -550,6 +653,10 @@ def check_encoder(
                           "(standard FFmpeg stops at 5.1). ")
         report.message += ("TrueHD 5.1 verified." if verified
                            else f"5.1 also failed: {first_failure('5.1(side)')}")
+    elif missing:
+        report.status = STATUS_NOT_VERIFIED
+        report.message = ("This LibreMPEG build cannot be used: " + "; ".join(missing)
+                          + ". Use the LibreMPEG included with DTS2DD 1.1.2 or later.")
     else:
         report.status = STATUS_NOT_VERIFIED
         report.message = f"7.1 self-test failed: {first_failure('7.1')}"
@@ -599,7 +706,8 @@ def build_clip_cut_command(encoder: str, source: str, output: str,
 
 
 def build_truehd_command(encoder: str, job: TrueHDJob,
-                         source_hash_path: Optional[str] = None) -> List[str]:
+                         source_hash_path: Optional[str] = None,
+                         packet_sizes_path: Optional[str] = None) -> List[str]:
     """LibreMPEG command that copies every stream and appends a TrueHD track.
 
     * Video, subtitles, other audio, chapters and attachments are copied
@@ -608,6 +716,9 @@ def build_truehd_command(encoder: str, job: TrueHDJob,
       values, so FFmpeg can never insert a silent downmix or resample - the
       encoder fails instead.
     * No filters are used: no normalisation, DRC, EQ or remixing.
+    * The header declares an 18 Mb/s peak data rate (see TRUEHD_PEAK_BITRATE);
+      ``packet_sizes_path`` records every access unit's size so the app can
+      prove each one fits.
     * With ``source_hash_path``, a second output writes the SHA-256 of the
       decoded source PCM - the exact samples fed to the encoder - in the same
       pass, so strict verification never has to re-read the source film.
@@ -624,9 +735,13 @@ def build_truehd_command(encoder: str, job: TrueHDJob,
         f"-ch_layout:a:{k}", job.layout,
         f"-sample_fmt:a:{k}", job.sample_fmt,
         f"-ar:a:{k}", str(job.sample_rate),
+        f"-peak_bitrate:a:{k}", str(TRUEHD_PEAK_BITRATE),
         f"-bsf:a:{k}", END_PADDING_FIX,
         f"-metadata:s:a:{k}", f"title={job.title}",
     ]
+    if packet_sizes_path:
+        cmd += [f"-stats_enc_post:a:{k}", packet_sizes_path,
+                f"-stats_enc_post_fmt:a:{k}", "{size}"]
     if job.language:
         cmd += [f"-metadata:s:a:{k}", f"language={job.language}"]
     if job.make_default:
@@ -671,6 +786,34 @@ def read_hash_file(path: str) -> Optional[str]:
     except OSError:
         pass
     return None
+
+
+def check_access_unit_sizes(sizes_path: str, peak_bitrate: int,
+                            sample_rate: int) -> Tuple[Optional[str], str]:
+    """Check every encoded access unit fits the declared peak data rate.
+
+    Returns (error or None, summary).
+    """
+    limit = max_access_unit_bytes(peak_bitrate, sample_rate)
+    try:
+        with open(sizes_path, "r", encoding="ascii", errors="replace") as f:
+            sizes = [int(line) for line in f if line.strip().isdigit()]
+    except OSError as e:
+        return f"access unit sizes were not recorded ({e})", ""
+    if not sizes:
+        return "access unit sizes were not recorded", ""
+    au_seconds = 40 / (44100 if sample_rate % 44100 == 0 else 48000)
+    largest = max(sizes)
+    over = [i for i, size in enumerate(sizes) if size > limit]
+    summary = (f"largest access unit {largest} bytes of {limit:.0f} allowed "
+               f"({largest * 8 / au_seconds / 1e6:.1f} of {peak_bitrate / 1e6:.1f} Mb/s), "
+               f"{len(sizes):,} checked")
+    if over:
+        t = over[0] * au_seconds
+        return (f"{len(over)} access unit(s) exceed the declared {peak_bitrate / 1e6:.1f} Mb/s peak, "
+                f"first at {int(t // 3600)}:{int(t % 3600 // 60):02d}:{t % 60:06.3f} - "
+                "AV receivers may glitch there"), summary
+    return None, summary
 
 
 def build_source_decode_command(encoder: str, job: TrueHDJob) -> List[str]:
@@ -808,6 +951,7 @@ def create_channel_test_file(
             "-c:v", "copy", "-c:s", "srt",
             "-c:a", "truehd", "-strict:a:0", "experimental",
             "-ch_layout:a:0", layout, "-sample_fmt:a:0", "s32p", "-bsf:a:0", END_PADDING_FIX,
+            "-peak_bitrate:a:0", str(TRUEHD_PEAK_BITRATE),
             "-metadata:s:a:0", f"title=Dolby TrueHD {LAYOUT_LABELS[layout]} speaker test",
             "-metadata:s:s:0", "title=Speaker names",
             "-disposition:s:0", "default+forced",

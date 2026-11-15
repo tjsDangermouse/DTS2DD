@@ -13,7 +13,8 @@ external processes. They are not linked into the converter.
 2. LibreMPEG (folder: librempeg\)
    Used only for Dolby TrueHD encoding.
    Built from https://github.com/librempeg/librempeg at the commit listed in
-   LibreMPEG-SOURCE.txt with --enable-agpl.
+   LibreMPEG-SOURCE.txt with --enable-agpl --enable-zlib, and modified by the
+   patch included in this folder (librempeg-truehd-peak-bitrate.patch).
    Licence: GNU Affero General Public License version 3 or later
    (see LibreMPEG-COPYING.AGPLv3.txt and LibreMPEG-LICENSE.md).
    Corresponding source code: the commit above. The exact build commands are

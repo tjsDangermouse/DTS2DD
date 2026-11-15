@@ -25,8 +25,12 @@ LIBREMPEG_HELP = """Encoder truehd [TrueHD]:
     Supported sample rates: 44100 48000 88200 96000 176400 192000
     Supported sample formats: s16p s32p
     Supported channel layouts: mono stereo 2.1 3.0 3.1 4.0 4.1 5.0(side) 5.1(side) 5.0 5.1 6.0 6.1 7.0 7.1
+mlpenc AVOptions:
+  -max_interval      <int>        E...A...... Max number of frames between each new header
+  -peak_bitrate      <int>        E...A...... Peak data rate signalled in the major sync header (bits/s).
 """
-FFMPEG_HELP = LIBREMPEG_HELP.replace(" 5.0 5.1 6.0 6.1 7.0 7.1", "")
+FFMPEG_HELP = LIBREMPEG_HELP.replace(" 5.0 5.1 6.0 6.1 7.0 7.1", "").replace(
+    "  -peak_bitrate      <int>        E...A...... Peak data rate signalled in the major sync header (bits/s).\n", "")
 
 
 def dts_stream(layout="7.1", channels=8, profile="DTS-HD MA", fmt="s32p", rate=48000,
@@ -172,6 +176,7 @@ class EncoderDiscoveryTests(unittest.TestCase):
 
     def test_e_encoder_lacking_71(self):
         caps = te.parse_encoder_help(FFMPEG_HELP)
+        caps.has_peak_option = caps.has_zlib = True
         ok = te.LayoutTest("5.1(side)", 24, True, "ok")
         with tempfile.NamedTemporaryFile() as fake, \
                 mock.patch.object(te, "query_capabilities", return_value=caps), \
@@ -180,6 +185,25 @@ class EncoderDiscoveryTests(unittest.TestCase):
         self.assertEqual(report.status, te.STATUS_NO_71)
         self.assertEqual(report.verified_layouts, ["5.1(side)"])
         self.assertFalse(report.can_encode("7.1"))
+
+    def test_unpatched_or_no_zlib_build_not_verified(self):
+        """7.1-capable LibreMPEG without the peak fix or zlib must not be used."""
+        for peak, zlib, expect in ((False, True, "peak data rate fix"), (True, False, "without zlib")):
+            caps = te.parse_encoder_help(LIBREMPEG_HELP)
+            caps.has_peak_option, caps.has_zlib = peak, zlib
+            ok = te.LayoutTest("x", 24, True, "ok")
+            with tempfile.NamedTemporaryFile() as fake, \
+                    mock.patch.object(te, "query_capabilities", return_value=caps), \
+                    mock.patch.object(te, "run_layout_test", return_value=ok) as run:
+                report = te.check_encoder(fake.name)
+            self.assertEqual(report.status, te.STATUS_NOT_VERIFIED)
+            self.assertIn(expect, report.message)
+            self.assertFalse(report.is_usable)
+            run.assert_not_called()
+
+    def test_capability_flags_parsed(self):
+        self.assertTrue(te.parse_encoder_help(LIBREMPEG_HELP).has_peak_option)
+        self.assertFalse(te.parse_encoder_help(FFMPEG_HELP).has_peak_option)
 
     def test_encoder_without_truehd(self):
         with tempfile.NamedTemporaryFile() as fake, \
@@ -248,6 +272,11 @@ class ChannelMappingTests(unittest.TestCase):
         self.assertEqual((sync.sample_rate, sync.ch6_assignment, sync.ch8_assignment), (48000, 0x0F, 0x4F))
         self.assertIsNone(te.check_channel_assignment("7.1", sync))
         self.assertIn("Lrs/Rrs", te.MajorSync.describe(0x4F))
+        self.assertEqual(sync.peak_bitrate, 0)
+        peak_word = (1 << 15) | 5999                   # is_vbr + 18 Mb/s at 48 kHz
+        data18 = b"\x00" * 4 + te.TRUEHD_SYNC + word.to_bytes(4, "big") + b"\xb7\x52" + b"\x00" * 4 \
+            + peak_word.to_bytes(2, "big") + b"\x00" * 4
+        self.assertEqual(te.parse_major_sync(data18).peak_bitrate, 17_997_000)
         wrong = te.MajorSync(48000, 0x07, 0x47)       # what 5.1(back) produces
         self.assertIsNotNone(te.check_channel_assignment("7.1", wrong))
         self.assertIsNone(te.parse_major_sync(b"no sync here"))
@@ -326,6 +355,26 @@ class CommandTests(unittest.TestCase):
             p.write_text("garbage")
             self.assertIsNone(te.read_hash_file(str(p)))
             self.assertIsNone(te.read_hash_file(str(Path(d, "missing"))))
+
+    def test_peak_rate_and_packet_sizes_in_command(self):
+        cmd = te.build_truehd_command("enc", self.job(), packet_sizes_path="/tmp/sizes.txt")
+        self.assertEqual(cmd[cmd.index("-peak_bitrate:a:2") + 1], "18000000")
+        self.assertEqual(cmd[cmd.index("-stats_enc_post:a:2") + 1], "/tmp/sizes.txt")
+        self.assertEqual(cmd[cmd.index("-stats_enc_post_fmt:a:2") + 1], "{size}")
+        self.assertLess(cmd.index("-stats_enc_post:a:2"), cmd.index("/m/.tmp.mkv"))
+
+    def test_access_unit_size_check(self):
+        self.assertAlmostEqual(te.max_access_unit_bytes(9_600_000, 48000), 1000)
+        self.assertAlmostEqual(te.max_access_unit_bytes(18_000_000, 96000), 1875)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d, "sizes.txt")
+            p.write_text("900\n1018\n950\n")             # Spectre at 0:34.5 with a 9.6 Mb/s header
+            error, _ = te.check_access_unit_sizes(str(p), 9_600_000, 48000)
+            self.assertIn("1 access unit(s) exceed", error)
+            error, summary = te.check_access_unit_sizes(str(p), 17_997_000, 48000)
+            self.assertIsNone(error)
+            self.assertIn("largest access unit 1018 bytes", summary)
+            self.assertIsNotNone(te.check_access_unit_sizes(str(Path(d, "none.txt")), 18_000_000, 48000)[0])
 
     def test_end_padding_fix_applied(self):
         cmd = te.build_truehd_command("enc", self.job())

@@ -181,7 +181,10 @@ class TrueHDWorkflowTests(Workdir):
         self.assertEqual(dovi[0]["dv_profile"], 8)
         self.assertEqual(media_probe.video_packet_hashes(FFMPEG, str(source), max_packets=10000),
                          media_probe.video_packet_hashes(FFMPEG, result.final_path, max_packets=10000))
-        self.assertTrue(any(c.name.startswith("Video 1 packet") and c.passed for c in result.checks))
+        self.assertTrue(any(c.name == "Copied tracks identical to original" and c.passed for c in result.checks))
+        self.assertTrue(any(c.name == "TrueHD data rate within declared peak" and c.passed for c in result.checks))
+        sync = te.read_major_sync(LIBRE, result.final_path, 2)
+        self.assertAlmostEqual(sync.peak_bitrate, te.TRUEHD_PEAK_BITRATE, delta=3001)
 
     def test_j_k_remove_original_and_make_default(self):
         source = self.copy(self.fixture71)
@@ -315,8 +318,8 @@ class TrueHDWorkflowTests(Workdir):
         source = self.copy(self.fixture71)
         real_encode = tw.TrueHDConverter._encode
 
-        def encode_then_corrupt(conv, job, total, source_hash_path=None):
-            real_encode(conv, job, total, source_hash_path)
+        def encode_then_corrupt(conv, job, total, source_hash_path=None, packet_sizes_path=None):
+            real_encode(conv, job, total, source_hash_path, packet_sizes_path)
             with open(source_hash_path, "w") as f:
                 f.write("SHA256=" + "0" * 64 + "\n")
 
@@ -328,6 +331,34 @@ class TrueHDWorkflowTests(Workdir):
         locate.assert_called_once()
         self.assertIn("Lossless verification failed", str(ctx.exception))
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["Spectre.mkv"])
+
+    def test_oversized_access_unit_fails(self):
+        """If an access unit exceeded the declared peak rate, the conversion fails."""
+        source = self.copy(self.fixture71)
+        real_check = te.check_access_unit_sizes
+        with mock.patch.object(tw, "check_access_unit_sizes",
+                               side_effect=lambda path, peak, rate: real_check(path, 9_600_000 // 10, rate)):
+            with self.assertRaises(te.TrueHDError) as ctx:
+                self.converter().convert(str(source), 1, tw.TrueHDOptions(strict_verify=False))
+        self.assertIn("exceed the declared", str(ctx.exception))
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["Spectre.mkv"])
+
+    def test_corrupted_copied_track_fails(self):
+        """A copied track whose packets differ from the original fails verification."""
+        source = self.copy(self.fixture71)
+        real_hashes = tw.stream_packet_hashes
+
+        def tamper(ffmpeg, path, indices, seconds, seek=None):
+            result = real_hashes(ffmpeg, path, indices, seconds, seek)
+            if ".truehd-partial-" in str(path):          # the new file: alter the subtitle packets
+                sub = indices[-1]
+                result[sub] = [(size, "0" * 32, dts) for size, _, dts in result[sub]]
+            return result
+
+        with mock.patch.object(tw, "stream_packet_hashes", side_effect=tamper):
+            with self.assertRaises(te.TrueHDError) as ctx:
+                self.converter().convert(str(source), 1, tw.TrueHDOptions(strict_verify=False))
+        self.assertIn("packets differ from the original", str(ctx.exception))
 
     def test_cancel_removes_temp(self):
         source = self.copy(self.fixture71)

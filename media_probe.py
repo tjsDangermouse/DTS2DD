@@ -264,6 +264,57 @@ def video_packet_hashes(
     return hashes
 
 
+def stream_packet_hashes(
+    ffmpeg_path: str,
+    file_path: str,
+    stream_indices: Sequence[int],
+    seconds: float,
+    seek: Optional[float] = None,
+    timeout: int = 1800,
+) -> Dict[int, List[Tuple[str, str, float]]]:
+    """(size, md5, dts seconds) of every packet of the given streams within a time window.
+
+    One pass with stream copy, so payloads are hashed exactly as the demuxer
+    delivers them (after Matroska content decoding such as zlib). Returns a
+    dict keyed by the requested stream index.
+    """
+    cmd = [ffmpeg_path, "-hide_banner", "-nostdin", "-v", "error"]
+    if seek is not None:
+        cmd += ["-ss", f"{seek:.6f}"]
+    cmd += ["-t", f"{seconds:.3f}", "-i", file_path]
+    for index in stream_indices:
+        cmd += ["-map", f"0:{index}"]
+    cmd += ["-c", "copy", "-f", "framemd5", "-"]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=timeout, creationflags=subprocess_flags(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Could not read packets: {result.stderr.strip()[-300:]}")
+    hashes: Dict[int, List[Tuple[str, str, float]]] = {index: [] for index in stream_indices}
+    time_bases: Dict[int, float] = {}
+    for line in result.stdout.splitlines():
+        if line.startswith("#tb "):                     # "#tb 0: 1/1000"
+            key, _, value = line[4:].partition(":")
+            num, _, den = value.strip().partition("/")
+            try:
+                time_bases[int(key)] = int(num) / int(den)
+            except (ValueError, ZeroDivisionError):
+                pass
+            continue
+        if not line or line.startswith("#"):
+            continue
+        fields = [f.strip() for f in line.split(",")]
+        if len(fields) >= 6 and fields[0].isdigit() and int(fields[0]) < len(stream_indices):
+            k = int(fields[0])
+            try:
+                dts = int(fields[1]) * time_bases.get(k, 0.0)
+            except ValueError:
+                dts = 0.0
+            hashes[stream_indices[k]].append((fields[4], fields[5], dts))
+    return hashes
+
+
 def keyframe_at_or_before(ffprobe_path: str, file_path: str, target: float,
                           video_index: int = 0) -> Optional[float]:
     """Find the timestamp of the last video keyframe at or before ``target``."""

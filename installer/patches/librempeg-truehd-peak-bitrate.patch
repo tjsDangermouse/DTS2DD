@@ -1,0 +1,42 @@
+From: DTS2DD <noreply@github.com>
+Subject: [PATCH] avcodec/mlpenc: make the signalled peak data rate configurable
+
+The TrueHD/MLP encoder always wrote a peak data rate of 9.6 Mb/s into the
+major sync header. Because every access unit is given the same input
+timing, hardware decoders expect each access unit to arrive within its own
+1/1200 s at no more than that rate, i.e. at most 1000 bytes at 48 kHz.
+Loud, dense 7.1 passages exceed this (e.g. 1018-byte access units) and AV
+receivers glitch, while software decoders ignore the field.
+
+Add a "peak_bitrate" option (default unchanged, 9.6 Mb/s; maximum 18 Mb/s,
+the TrueHD limit) so callers can signal a rate the stream honours.
+
+diff --git a/libavcodec/mlpenc.c b/libavcodec/mlpenc.c
+index 98849f5..e3f025a 100644
+--- a/libavcodec/mlpenc.c
++++ b/libavcodec/mlpenc.c
+@@ -142,6 +142,7 @@ typedef struct MLPEncodeContext {
+     int             rematrix_precision;
+     int             lpc_type;
+     int             lpc_passes;
++    int             peak_bitrate;           ///< peak data rate signalled in the major sync header (bits/s)
+     int             prediction_order;
+     int             max_codebook_search;
+ 
+@@ -529,7 +530,7 @@ static av_cold int mlp_encode_init(AVCodecContext *avctx)
+     }
+     ctx->coded_sample_rate[1] = -1 & 0xf;
+ 
+-    ctx->coded_peak_bitrate = mlp_peak_bitrate(9600000, avctx->sample_rate);
++    ctx->coded_peak_bitrate = mlp_peak_bitrate(ctx->peak_bitrate, avctx->sample_rate);
+ 
+     ctx->substream_info |= SUBSTREAM_INFO_ALWAYS_SET;
+     if (avctx->ch_layout.nb_channels <= 2)
+@@ -2332,6 +2333,7 @@ static const AVOption mlp_options[] = {
+ { "estimation", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = ORDER_METHOD_EST },    0, 0, FLAGS, .unit = "predm" },
+ { "search",     NULL, 0, AV_OPT_TYPE_CONST, {.i64 = ORDER_METHOD_SEARCH }, 0, 0, FLAGS, .unit = "predm" },
+ { "rematrix_precision", "Rematrix coefficient precision", OFFSET(rematrix_precision), AV_OPT_TYPE_INT, {.i64 = 1 }, 0, 14, FLAGS },
++{ "peak_bitrate", "Peak data rate signalled in the major sync header (bits/s). The encoder uses a constant input timing, so every access unit must fit within this rate.", OFFSET(peak_bitrate), AV_OPT_TYPE_INT, {.i64 = 9600000 }, 1000000, 18000000, FLAGS },
+ { NULL },
+ };
+ 
