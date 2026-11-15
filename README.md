@@ -1,6 +1,6 @@
 # DTS to Dolby Digital (AC-3) MKV Converter
 
-A cross-platform Python application with a simple GUI for converting DTS audio in MKV files to Dolby Digital (AC-3) format.
+A cross-platform Python application with a simple GUI for converting DTS audio in MKV files to Dolby Digital (AC-3), Dolby Digital Plus (E-AC-3), or lossless **Dolby TrueHD** (from DTS-HD Master Audio).
 
 ## Features
 
@@ -10,6 +10,7 @@ A cross-platform Python application with a simple GUI for converting DTS audio i
 - **Cross-Platform**: Works on macOS and Windows.
 - **Flexible Bitrate Selection**: Choose AC-3 bitrate (192k to 640k) for output.
 - **Progress Indication**: Visual feedback during conversion process.
+- **Lossless Dolby TrueHD (new)**: Adds a Dolby TrueHD 5.1/7.1 track converted bit-for-bit from DTS-HD Master Audio, using a separately configured LibreMPEG encoder. Video and all other tracks are copied untouched. See [Dolby TrueHD](#dolby-truehd-lossless) below.
 
 ## Requirements
 
@@ -17,6 +18,13 @@ A cross-platform Python application with a simple GUI for converting DTS audio i
 - **py7zr**: For extracting FFmpeg on macOS (automatically installed via requirements.txt)
 
 ## Installation
+
+**Windows:** run `DTS2DD-Setup-<version>.exe` (from the GitHub Actions
+artifact or a GitHub release), click Install, done. FFmpeg and the TrueHD
+encoder are included. The installer is unsigned, so SmartScreen may ask you to
+click "More info" -> "Run anyway". See BUILD_AND_DISTRIBUTE.md for how it is built.
+
+**From source:**
 
 1. Clone or download this repository
 2. Install dependencies:
@@ -54,6 +62,42 @@ The application writes a temporary MKV in the same folder and replaces the
 source file only after FFmpeg completes successfully. All existing streams are
 preserved by default; enabling removal omits only the selected original audio track.
 
+## Dolby TrueHD (Lossless)
+
+Choose **Dolby TrueHD (Lossless)** as the codec to append a TrueHD copy of a
+DTS-HD MA 5.1 or 7.1 track - useful when a player (e.g. Fire TV Stick 4K Plus)
+passes TrueHD to the receiver but only the lossy core of DTS-HD MA.
+
+- **Lossless and verified**: DTS-HD MA (lossless XLL decode) -> integer PCM ->
+  TrueHD in one pass, no filters. Strict mode (on by default) decodes the
+  original and the new track and confirms every sample is identical.
+- **Channels preserved**: 7.1 stays 7.1, 5.1 stays 5.1. Unsupported layouts
+  (7.1 "wide", 6.1, 5.1 with rear surrounds) and lossy DTS are refused, never
+  converted approximately.
+- **Not Atmos**: TrueHD 7.1 is channel-based; no object/height metadata is
+  added and the track is titled e.g. "Dolby TrueHD 7.1".
+- **Safe output**: saves `Film_Sound_TrueHD.mkv` by default; replacing the
+  original is optional and only offered after all checks pass. The original
+  DTS-HD MA track is kept unless you choose to remove it.
+- **Video untouched**: stream copy only; HEVC, HDR10 and Dolby Vision
+  (profile 7/8) configuration and packet data are checked after conversion.
+- **Test clip mode**: 30/60/120-second clips for checking Plex / receiver
+  playback before converting a whole film.
+- **Encoder**: [LibreMPEG](https://github.com/librempeg/librempeg) (standard
+  FFmpeg cannot encode TrueHD 7.1). It is self-tested on every start; no
+  binary is downloaded automatically. See USER_GUIDE.md for setup and
+  BUILD_AND_DISTRIBUTE.md for building it and its AGPL licence.
+
+Playback on Plex / Fire TV / AV receivers has **not** been verified by
+automated tests - see "Testing on Fire TV / Plex / Denon" in USER_GUIDE.md.
+
+### Tests
+
+```bash
+python tests/fetch_samples.py      # FATE DTS-HD MA + Dolby Vision samples (~7 MB)
+DTS2DD_LIBREMPEG=/path/to/librempeg/ffmpeg python -m pytest tests -v
+```
+
 ## File Structure
 
 ```
@@ -62,6 +106,11 @@ dts_to_ac3_converter/
 ├── ffmpeg_downloader.py      # FFmpeg auto-detection and download
 ├── ffmpeg_helper.py          # FFmpeg subprocess management
 ├── audio_stream_info.py      # Audio stream data model
+├── media_probe.py            # ffprobe JSON probing, format identification, video checks
+├── truehd_encoder.py         # LibreMPEG discovery, self-test, TrueHD commands
+├── truehd_workflow.py        # TrueHD conversion, verification, safe output
+├── app_settings.py           # Persistent settings (LibreMPEG path)
+├── tests/                    # Unit + integration tests
 ├── requirements.txt          # Python dependencies
 └── ffmpeg/                   # Auto-created, contains downloaded FFmpeg
     └── ffmpeg (or ffmpeg.exe on Windows)
@@ -89,11 +138,13 @@ The application uses FFmpeg's probe functionality to scan the input file and ext
 
 ### Conversion
 
-FFmpeg command used:
+FFmpeg command used (AC-3 / E-AC-3):
 ```
-ffmpeg -i input.mkv -map 0 -map 0:[selected-stream] -c copy \
+ffmpeg -i input.mkv -map 0 -map -0:t? -map 0:[selected-stream] -map 0:t? -c copy \
   -c:a:[new-track] ac3 -b:a:[new-track] [bitrate] temporary.mkv -y
 ```
+Attachments (fonts) are mapped last: FFmpeg's Matroska muxer otherwise fails
+with "Received a packet for an attachment stream" on MKVs that contain them.
 
 This approach:
 - Copies all existing streams, then appends the selected source track as AC-3/Dolby Digital
@@ -168,6 +219,8 @@ The application can detect and display all audio codecs:
 ## Output Codec
 
 - **AC-3 (Dolby Digital)** - Selectable bitrates: 192k, 224k, 256k, 320k, 384k, 448k, 640k
+- **E-AC-3 (Dolby Digital Plus)** - Selectable bitrates up to 768k
+- **Dolby TrueHD** - Lossless, from DTS-HD MA 5.1 / 7.1 only (requires LibreMPEG)
 
 ## Platform Notes
 

@@ -1,21 +1,39 @@
 """FFmpeg subprocess management and audio stream parsing."""
-import re
-import subprocess
-import platform
+import collections
 import os
+import re
+import shutil
+import subprocess
 import tempfile
-from typing import Callable, List, Optional
+import threading
+import time
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Sequence
 
 from audio_stream_info import AudioStreamInfo
+from media_probe import audio_streams_from_probe, find_ffprobe, run_ffprobe, subprocess_flags
 
 
-def get_audio_streams(file_path: str, ffmpeg_path: str) -> List[AudioStreamInfo]:
+class ConversionCancelled(RuntimeError):
+    """Raised when the user cancels a running FFmpeg process."""
+
+
+def get_audio_streams(
+    file_path: str,
+    ffmpeg_path: str,
+    ffprobe_path: Optional[str] = None,
+) -> List[AudioStreamInfo]:
     """
     Probe an MKV file and extract audio stream information.
+
+    Uses ffprobe JSON output when ffprobe is available (accurate channel
+    layout, profile, bit depth, title and dispositions). Falls back to the
+    original parsing of ``ffmpeg -i`` text output otherwise.
 
     Args:
         file_path: Path to the input MKV file
         ffmpeg_path: Path to the ffmpeg binary
+        ffprobe_path: Optional ffprobe binary (located automatically if omitted)
 
     Returns:
         List of AudioStreamInfo objects
@@ -23,12 +41,28 @@ def get_audio_streams(file_path: str, ffmpeg_path: str) -> List[AudioStreamInfo]
     Raises:
         RuntimeError: If FFmpeg probe fails
     """
+    ffprobe_path = ffprobe_path or find_ffprobe(ffmpeg_path)
+    if ffprobe_path:
+        try:
+            streams = audio_streams_from_probe(run_ffprobe(ffprobe_path, file_path))
+            if streams:
+                return streams
+        except RuntimeError:
+            pass  # fall back to the text parser below
+    return _get_audio_streams_text(file_path, ffmpeg_path)
+
+
+def _get_audio_streams_text(file_path: str, ffmpeg_path: str) -> List[AudioStreamInfo]:
+    """Original text-based probe (kept for builds without ffprobe)."""
     try:
         result = subprocess.run(
             [ffmpeg_path, "-i", file_path],
             capture_output=True,
             text=True,
-            timeout=10
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            creationflags=subprocess_flags(),
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError("FFmpeg probe timed out")
@@ -39,7 +73,7 @@ def get_audio_streams(file_path: str, ffmpeg_path: str) -> List[AudioStreamInfo]
     # Example line: Stream #0:1(eng): Audio: dts (DTS), 48000 Hz, 5.1(side), fltp, 1536 kb/s
     audio_streams = []
     stream_pattern = re.compile(
-        r'Stream #(\d+):(\d+)(?:\((\w+)\))?: Audio: ([^,]+), (\d+) Hz, ([^,]+)(?:, [^,]+)?,(?:\s+(\d+)\s+kb/s)?'
+        r'Stream #(\d+):(\d+)(?:\[\w+\])?(?:\((\w+)\))?: Audio: ([^,]+), (\d+) Hz, ([^,]+)(?:, [^,]+)?,(?:\s+(\d+)\s+kb/s)?'
     )
 
     for line in result.stderr.split('\n'):
@@ -60,7 +94,8 @@ def get_audio_streams(file_path: str, ffmpeg_path: str) -> List[AudioStreamInfo]
                 codec_name=codec_clean,
                 channels=channels,
                 bitrate=bitrate_str,
-                language=lang if lang else None
+                language=lang if lang else None,
+                audio_index=len(audio_streams),
             ))
 
     if not audio_streams:
@@ -68,6 +103,207 @@ def get_audio_streams(file_path: str, ffmpeg_path: str) -> List[AudioStreamInfo]
 
     return audio_streams
 
+
+# --------------------------------------------------------------------------
+# Command building shared by the AC-3/E-AC-3 and TrueHD workflows
+# --------------------------------------------------------------------------
+
+def build_stream_maps(source_stream_index: int, remove_source_stream: bool) -> List[str]:
+    """Map every input stream, plus the selected audio stream a second time.
+
+    Attachments (fonts etc.) are moved to the end. FFmpeg's Matroska muxer
+    rejects the job ("Received a packet for an attachment stream") when an
+    encoded stream is mapped after an attachment; Matroska stores
+    attachments separately from tracks, so this changes nothing visible.
+    """
+    maps = ["-map", "0"]
+    if remove_source_stream:
+        maps += ["-map", f"-0:{source_stream_index}"]
+    maps += [
+        "-map", "-0:t?",
+        "-map", f"0:{source_stream_index}",
+        "-map", "0:t?",
+    ]
+    return maps
+
+
+def converted_audio_output_index(audio_stream_count: int, remove_source_stream: bool) -> int:
+    """Output audio index (the N in ``a:N``) of the appended converted stream."""
+    return audio_stream_count - (1 if remove_source_stream else 0)
+
+
+def build_append_audio_command(
+    ffmpeg_path: str,
+    source_path: str,
+    output_path: str,
+    source_stream_index: int,
+    audio_stream_count: int,
+    codec: str,
+    bitrate: str,
+    remove_source_stream: bool,
+) -> List[str]:
+    """FFmpeg command for the AC-3 / E-AC-3 append workflow."""
+    converted_audio_index = converted_audio_output_index(audio_stream_count, remove_source_stream)
+    cmd = [ffmpeg_path, "-hide_banner", "-nostdin", "-i", source_path]
+    cmd += build_stream_maps(source_stream_index, remove_source_stream)
+    cmd += [
+        "-c", "copy",
+        f"-c:a:{converted_audio_index}", codec,
+        f"-b:a:{converted_audio_index}", bitrate,
+        "-progress", "pipe:1", "-nostats",
+        "-y",
+        output_path,
+    ]
+    return cmd
+
+
+# --------------------------------------------------------------------------
+# Process runner with progress, stderr capture and cancellation
+# --------------------------------------------------------------------------
+
+@dataclass
+class FFmpegProgress:
+    out_seconds: float
+    total_seconds: Optional[float]
+    speed: Optional[float]
+    elapsed: float
+
+    @property
+    def fraction(self) -> Optional[float]:
+        if not self.total_seconds:
+            return None
+        return max(0.0, min(1.0, self.out_seconds / self.total_seconds))
+
+    @property
+    def eta(self) -> Optional[float]:
+        fraction = self.fraction
+        if not fraction or fraction <= 0.001:
+            return None
+        return self.elapsed * (1 - fraction) / fraction
+
+
+@dataclass
+class FFmpegResult:
+    returncode: int
+    stderr_tail: List[str]
+
+    def error_summary(self, max_lines: int = 8) -> str:
+        """The most useful stderr lines (FFmpeg prints the cause last)."""
+        lines = [l for l in self.stderr_tail if l.strip()]
+        return "\n".join(lines[-max_lines:]) or f"exit code {self.returncode}"
+
+
+class ProcessHandle:
+    """Lets another thread cancel the currently running process."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._proc = None
+        self.cancelled = threading.Event()
+
+    def attach(self, proc):
+        with self._lock:
+            self._proc = proc
+        if self.cancelled.is_set():
+            self._terminate(proc)
+
+    def detach(self):
+        with self._lock:
+            self._proc = None
+
+    def cancel(self):
+        self.cancelled.set()
+        with self._lock:
+            proc = self._proc
+        if proc is not None:
+            self._terminate(proc)
+
+    @staticmethod
+    def _terminate(proc):
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except OSError:
+            pass
+
+
+def run_ffmpeg(
+    cmd: Sequence[str],
+    total_seconds: Optional[float] = None,
+    on_progress: Optional[Callable[[FFmpegProgress], None]] = None,
+    handle: Optional[ProcessHandle] = None,
+    stderr_lines: int = 200,
+) -> FFmpegResult:
+    """Run FFmpeg with ``-progress pipe:1`` and report structured progress.
+
+    stderr is drained on a separate thread so the pipe can never fill and
+    stall the encoder; the last ``stderr_lines`` lines are kept for errors.
+    """
+    tail = collections.deque(maxlen=stderr_lines)
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            list(cmd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess_flags(),
+        )
+    except FileNotFoundError:
+        raise RuntimeError(f"Executable not found: {cmd[0]}")
+
+    if handle:
+        handle.attach(proc)
+
+    def drain_stderr():
+        for line in proc.stderr:
+            tail.append(line.rstrip())
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    out_seconds = 0.0
+    speed = None
+    try:
+        for line in proc.stdout:
+            key, _, value = line.strip().partition("=")
+            if key in ("out_time_us", "out_time_ms"):
+                # Both keys are in microseconds in current FFmpeg builds.
+                try:
+                    out_seconds = int(value) / 1_000_000
+                except ValueError:
+                    pass
+            elif key == "speed":
+                try:
+                    speed = float(value.rstrip("x"))
+                except ValueError:
+                    speed = None
+            elif key == "progress" and on_progress:
+                on_progress(FFmpegProgress(out_seconds, total_seconds, speed,
+                                           time.monotonic() - started))
+        proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        stderr_thread.join(timeout=5)
+        if handle:
+            handle.detach()
+
+    if handle and handle.cancelled.is_set():
+        raise ConversionCancelled("Conversion cancelled by user")
+    return FFmpegResult(proc.returncode, list(tail))
+
+
+# --------------------------------------------------------------------------
+# AC-3 / E-AC-3 workflow (in-place update, unchanged behaviour)
+# --------------------------------------------------------------------------
 
 def convert_and_append_audio(
     input_path: str,
@@ -77,7 +313,8 @@ def convert_and_append_audio(
     audio_stream_count: int,
     codec: str = "ac3",
     remove_source_stream: bool = False,
-    progress_callback: Optional[Callable[[str], None]] = None
+    progress_callback: Optional[Callable[[str], None]] = None,
+    handle: Optional[ProcessHandle] = None,
 ) -> bool:
     """
     Append a converted audio stream to an MKV, then safely replace that MKV.
@@ -96,6 +333,7 @@ def convert_and_append_audio(
         codec: Audio codec ("ac3" or "eac3")
         remove_source_stream: Remove the selected original stream from the result
         progress_callback: Optional function(message) to report progress
+        handle: Optional ProcessHandle used to cancel the conversion
 
     Returns:
         True on success, False on failure
@@ -113,54 +351,23 @@ def convert_and_append_audio(
         dir=source_dir,
     )
     os.close(file_descriptor)
+    # mkstemp creates owner-only files; keep the source's permissions so the
+    # replaced MKV stays readable by other users (e.g. a Plex service account).
+    shutil.copymode(source_path, temporary_path)
 
-    # The converted stream is the last audio mapping: all input streams are
-    # copied first, optionally minus the selected audio stream, then the
-    # selected source stream is mapped again for encoding.
-    converted_audio_index = audio_stream_count - (1 if remove_source_stream else 0)
-    cmd = [
-        ffmpeg_path,
-        "-i", source_path,
-        "-map", "0",
-    ]
-
-    if remove_source_stream:
-        cmd.extend(["-map", f"-0:{source_stream_index}"])
-
-    cmd.extend([
-        "-map", f"0:{source_stream_index}",
-        "-c", "copy",
-        f"-c:a:{converted_audio_index}", codec,
-        f"-b:a:{converted_audio_index}", bitrate,
-        "-progress", "pipe:1",
-        "-y",
-        temporary_path,
-    ])
+    cmd = build_append_audio_command(
+        ffmpeg_path, source_path, temporary_path, source_stream_index,
+        audio_stream_count, codec, bitrate, remove_source_stream,
+    )
 
     try:
-        # Platform-specific subprocess flags
-        creationflags = 0
-        if platform.system() == "Windows":
-            # Hide console window on Windows
-            creationflags = subprocess.CREATE_NO_WINDOW
-
         if progress_callback:
             progress_callback(f"Starting FFmpeg: {ffmpeg_path}")
             progress_callback(f"Input: {source_path}")
             progress_callback("Creating a temporary MKV before replacing the source file...")
             progress_callback("Encoding in progress...")
 
-        # Use run() for simple, reliable execution
-        result = subprocess.run(
-            cmd,
-            creationflags=creationflags,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-
-        if progress_callback:
-            progress_callback("Finalizing output... 100%")
-
+        result = run_ffmpeg(cmd, handle=handle)
         returncode = result.returncode
 
         if progress_callback:
@@ -169,13 +376,20 @@ def convert_and_append_audio(
         if returncode != 0:
             if progress_callback:
                 progress_callback(f"ERROR: FFmpeg failed with code {returncode}")
-            raise RuntimeError(f"FFmpeg conversion failed with code {returncode}")
+            raise RuntimeError(
+                f"FFmpeg conversion failed with code {returncode}:\n{result.error_summary()}"
+            )
+
+        if os.path.getsize(temporary_path) == 0:
+            raise RuntimeError("FFmpeg produced an empty file; the source was not changed")
 
         os.replace(temporary_path, source_path)
         if progress_callback:
             progress_callback("Source MKV updated successfully")
         return True
 
+    except ConversionCancelled:
+        raise
     except FileNotFoundError:
         raise RuntimeError("FFmpeg not found at specified path")
     except Exception as e:

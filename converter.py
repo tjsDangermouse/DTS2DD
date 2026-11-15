@@ -4,12 +4,34 @@ import sys
 import threading
 from pathlib import Path
 from tkinter import (
-    Tk, Frame, Label, Entry, Button, Text, messagebox,
+    Tk, Frame, Label, Entry, Button, Text, messagebox, Radiobutton,
     filedialog, Scrollbar, StringVar, BooleanVar, Checkbutton, ttk, LabelFrame, END, BOTH
 )
 
-from ffmpeg_downloader import ensure_ffmpeg_available
-from ffmpeg_helper import get_audio_streams, convert_and_append_audio
+from app_settings import get_setting, set_setting
+from ffmpeg_downloader import ensure_ffmpeg_available, get_ffmpeg_path
+from ffmpeg_helper import ConversionCancelled, ProcessHandle, get_audio_streams, convert_and_append_audio
+from media_probe import find_ffprobe, parse_timecode
+from truehd_encoder import (
+    LAYOUT_LABELS, STATUS_MISSING, STATUS_NO_71, STATUS_NOT_VERIFIED, STATUS_READY,
+    TrueHDError, check_encoder, create_channel_test_file,
+)
+from version import __version__
+from truehd_workflow import (
+    TrueHDConverter, TrueHDOptions, find_stale_partials, output_name, source_warnings,
+    validate_source,
+)
+
+CODEC_AC3 = "AC-3 (Dolby Digital)"
+CODEC_EAC3 = "E-AC-3 (Dolby Digital Plus)"
+CODEC_TRUEHD = "Dolby TrueHD (Lossless)"
+
+STATUS_COLOURS = {
+    STATUS_READY: "#1b7f2a",
+    STATUS_NO_71: "#b36b00",
+    STATUS_NOT_VERIFIED: "#b36b00",
+    STATUS_MISSING: "#b00020",
+}
 
 
 class ConverterApp:
@@ -17,23 +39,44 @@ class ConverterApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("DTS to AC-3 Converter")
-        self.root.geometry("800x820")
+        self.root.title(f"DTS to AC-3 Converter {__version__}")
+        self.root.geometry("860x900")
+        self.root.minsize(760, 640)
         self.ffmpeg_path = None
+        self.ffprobe_path = None
         self.current_file = None
         self.audio_streams = []
         self.status_label = None
         self.log_widget = None
 
+        self.encoder_report = None
+        self.encoder_checking = False
+        self.busy = False
+        self.job_handle = None
+        self.job_thread = None
+
         self._create_widgets()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._initialize_ffmpeg()
+
+    # ------------------------------------------------------------------
+    # Thread helpers
+    # ------------------------------------------------------------------
+
+    def _ui(self, func, *args):
+        """Run ``func`` on the Tk main thread (safe to call from workers)."""
+        self.root.after(0, lambda: func(*args))
 
     def _initialize_ffmpeg(self):
         """Initialize FFmpeg on app startup."""
         def get_ffmpeg():
             try:
                 self.ffmpeg_path = ensure_ffmpeg_available(progress_callback=self._log)
+                self.ffprobe_path = find_ffprobe(self.ffmpeg_path)
+                if not self.ffprobe_path:
+                    self._log("Note: ffprobe not found - using basic audio detection")
                 self.root.after(2000, lambda: self._update_status(""))
+                self._ui(self._check_truehd_encoder)
 
             except RuntimeError as e:
                 self.root.after(0, lambda: self._show_error(str(e)))
@@ -57,7 +100,7 @@ class ConverterApp:
     def _update_status(self, message: str):
         """Update status label (call from main thread via after)."""
         if self.status_label:
-            self.status_label.config(text=message)
+            self.status_label.config(text=message.splitlines()[0] if message else "")
             if message:
                 self.status_label.pack()
             else:
@@ -71,6 +114,10 @@ class ConverterApp:
         )
         self.root.destroy()
         sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Widgets
+    # ------------------------------------------------------------------
 
     def _create_widgets(self):
         """Create GUI widgets."""
@@ -101,13 +148,14 @@ class ConverterApp:
         scrollbar = Scrollbar(audio_frame)
         scrollbar.pack(side="right", fill="y")
 
-        self.audio_text = Text(audio_frame, height=8, yscrollcommand=scrollbar.set)
+        self.audio_text = Text(audio_frame, height=4, yscrollcommand=scrollbar.set)
         self.audio_text.pack(fill=BOTH, expand=True)
         scrollbar.config(command=self.audio_text.yview)
 
         # Conversion settings frame
         output_frame = LabelFrame(main_frame, text="Conversion Settings", padx=10, pady=10)
         output_frame.pack(fill="x", pady=(0, 10))
+        output_frame.columnconfigure(1, weight=1)
 
         Label(output_frame, text="Convert audio track:").grid(row=0, column=0, sticky="w")
         self.track_var = StringVar()
@@ -115,32 +163,37 @@ class ConverterApp:
             output_frame,
             textvariable=self.track_var,
             state="disabled",
-            width=50,
+            width=70,
         )
         self.track_combo.grid(row=0, column=1, sticky="w", padx=5)
+        self.track_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_truehd_compat())
 
         Label(output_frame, text="Audio Codec:").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        self.codec_var = StringVar(value="AC-3 (Dolby Digital)")
+        self.codec_var = StringVar(value=CODEC_AC3)
         codec_combo = ttk.Combobox(
             output_frame,
             textvariable=self.codec_var,
-            values=["AC-3 (Dolby Digital)", "E-AC-3 (Dolby Digital Plus)"],
+            values=[CODEC_AC3, CODEC_EAC3, CODEC_TRUEHD],
             state="readonly",
             width=25
         )
         codec_combo.grid(row=1, column=1, sticky="w", padx=5, pady=(10, 0))
-        codec_combo.bind("<<ComboboxSelected>>", lambda e: self._update_bitrate_options())
+        codec_combo.bind("<<ComboboxSelected>>", lambda e: self._on_codec_changed())
 
         Label(output_frame, text="Bitrate:").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        bitrate_cell = Frame(output_frame)
+        bitrate_cell.grid(row=2, column=1, sticky="w", padx=5, pady=(10, 0))
         self.bitrate_var = StringVar(value="384k")
         self.bitrate_combo = ttk.Combobox(
-            output_frame,
+            bitrate_cell,
             textvariable=self.bitrate_var,
             state="readonly",
             width=10
         )
-        self.bitrate_combo.grid(row=2, column=1, sticky="w", padx=5, pady=(10, 0))
-        self._update_bitrate_options()
+        self.bitrate_combo.pack(side="left")
+        self.lossless_label = Label(bitrate_cell, text="Lossless — automatic bitrate", fg="#555555")
+
+        self._create_truehd_panel(output_frame)
 
         self.remove_source_var = BooleanVar(value=False)
         self.remove_source_check = Checkbutton(
@@ -149,16 +202,20 @@ class ConverterApp:
             variable=self.remove_source_var,
             command=self._warn_about_removal,
         )
-        self.remove_source_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        Label(
+        self.remove_source_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.mode_note = Label(
             output_frame,
             text="The original MKV will be updated in place. All other streams are preserved.",
             fg="#555555",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        )
+        self.mode_note.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._update_bitrate_options()
 
         # Progress bar
-        self.progress = ttk.Progressbar(main_frame, mode="indeterminate")
-        self.progress.pack(fill="x", pady=(0, 10))
+        self.progress = ttk.Progressbar(main_frame, mode="indeterminate", maximum=100)
+        self.progress.pack(fill="x", pady=(0, 2))
+        self.progress_label = Label(main_frame, text="", fg="#555555", anchor="w")
+        self.progress_label.pack(fill="x", pady=(0, 8))
 
         # Convert button
         button_frame = Frame(main_frame)
@@ -176,6 +233,13 @@ class ConverterApp:
             command=self._detect_audio
         ).pack(side="left", padx=5)
 
+        self.cancel_button = Button(
+            button_frame, text="Cancel",
+            command=self._cancel_job,
+            state="disabled"
+        )
+        self.cancel_button.pack(side="left", padx=5)
+
         # Log viewer frame
         log_frame = LabelFrame(main_frame, text="Activity Log", padx=10, pady=10)
         log_frame.pack(fill=BOTH, expand=True, pady=(10, 0))
@@ -186,6 +250,70 @@ class ConverterApp:
         self.log_widget = Text(log_frame, height=6, state="disabled", yscrollcommand=log_scrollbar.set)
         self.log_widget.pack(fill=BOTH, expand=True)
         log_scrollbar.config(command=self.log_widget.yview)
+
+    def _create_truehd_panel(self, parent):
+        """TrueHD-only settings (shown when Dolby TrueHD is selected)."""
+        panel = Frame(parent)
+        self.truehd_panel = panel
+
+        Label(
+            panel, justify="left", fg="#333333",
+            text=("Output format: Dolby TrueHD    Compression: Lossless    Encoder: LibreMPEG\n"
+                  "Channels: Preserve original    Sample rate: Preserve original    "
+                  "Bit depth: Preserve where supported"),
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(8, 4))
+
+        Label(panel, text="Encoder status:").grid(row=1, column=0, sticky="w")
+        self.encoder_status_label = Label(panel, text="Checking...", fg="#555555")
+        self.encoder_status_label.grid(row=1, column=1, sticky="w", padx=5)
+        buttons = Frame(panel)
+        buttons.grid(row=1, column=2, columnspan=2, sticky="w")
+        Button(buttons, text="Browse...", command=self._browse_encoder).pack(side="left", padx=2)
+        Button(buttons, text="Re-check", command=self._check_truehd_encoder).pack(side="left", padx=2)
+        self.speaker_test_button = Button(buttons, text="Speaker test file...",
+                                          command=self._create_speaker_test, state="disabled")
+        self.speaker_test_button.pack(side="left", padx=2)
+
+        self.encoder_detail_label = Label(panel, text="", fg="#555555", justify="left",
+                                          wraplength=760, anchor="w")
+        self.encoder_detail_label.grid(row=2, column=0, columnspan=4, sticky="w")
+        self.compat_label = Label(panel, text="", justify="left", wraplength=760, anchor="w")
+        self.compat_label.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        self.make_default_var = BooleanVar(value=False)
+        Checkbutton(panel, text="Make converted audio the default track",
+                    variable=self.make_default_var).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.strict_verify_var = BooleanVar(value=True)
+        Checkbutton(panel, text="Strict lossless verification (decode both tracks and compare every sample)",
+                    variable=self.strict_verify_var).grid(row=5, column=0, columnspan=4, sticky="w")
+
+        output_row = Frame(panel)
+        output_row.grid(row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        Label(output_row, text="Output:").pack(side="left")
+        self.output_mode_var = StringVar(value="new")
+        Radiobutton(output_row, text="Save as new MKV (…_Sound_TrueHD.mkv)",
+                    variable=self.output_mode_var, value="new").pack(side="left", padx=4)
+        Radiobutton(output_row, text="Replace original after verification (asks first)",
+                    variable=self.output_mode_var, value="replace").pack(side="left", padx=4)
+
+        clip_row = Frame(panel)
+        clip_row.grid(row=7, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.test_clip_var = BooleanVar(value=False)
+        Checkbutton(clip_row, text="Create short test conversion", variable=self.test_clip_var,
+                    command=self._update_clip_state).pack(side="left")
+        Label(clip_row, text="Length:").pack(side="left", padx=(10, 2))
+        self.clip_length_var = StringVar(value="60 s")
+        self.clip_length_combo = ttk.Combobox(clip_row, textvariable=self.clip_length_var,
+                                              values=["30 s", "60 s", "120 s"], state="disabled", width=6)
+        self.clip_length_combo.pack(side="left")
+        Label(clip_row, text="Start at (h:mm:ss):").pack(side="left", padx=(10, 2))
+        self.clip_start_var = StringVar(value="0:00:00")
+        self.clip_start_entry = Entry(clip_row, textvariable=self.clip_start_var, width=9, state="disabled")
+        self.clip_start_entry.pack(side="left")
+
+    # ------------------------------------------------------------------
+    # File / stream selection
+    # ------------------------------------------------------------------
 
     def _select_file(self):
         """Open file dialog to select MKV file."""
@@ -200,11 +328,51 @@ class ConverterApp:
             # Log and auto-detect audio
             filename = Path(file_path).name
             self._log(f"File selected: {filename}")
+            self._offer_partial_cleanup(file_path)
             self._detect_audio()
+
+    def _offer_partial_cleanup(self, file_path):
+        """Offer to delete temporary files left by an interrupted conversion."""
+        if self.busy:
+            return  # never offer to delete the running job's temporary file
+        stale = find_stale_partials(file_path)
+        if not stale:
+            return
+        names = "\n".join(Path(p).name for p in stale)
+        if messagebox.askyesno(
+            "Leftover temporary files",
+            "These temporary files were left by an interrupted conversion "
+            f"(the original MKV was not modified):\n\n{names}\n\nDelete them now?"
+        ):
+            for path in stale:
+                try:
+                    os.unlink(path)
+                    self._log(f"Deleted leftover temporary file: {Path(path).name}")
+                except OSError as e:
+                    self._log(f"Could not delete {Path(path).name}: {e}")
+
+    def _is_truehd(self) -> bool:
+        return self.codec_var.get() == CODEC_TRUEHD
+
+    def _on_codec_changed(self):
+        self._update_bitrate_options()
+        self._refresh_truehd_compat()
 
     def _update_bitrate_options(self):
         """Update available bitrates based on selected codec."""
         codec = self.codec_var.get()
+        if codec == CODEC_TRUEHD:
+            self.bitrate_combo.config(state="disabled")
+            self.lossless_label.pack(side="left", padx=8)
+            self.truehd_panel.grid(row=3, column=0, columnspan=2, sticky="w")
+            self.mode_note.config(text="TrueHD saves a new MKV by default. The original is only "
+                                       "replaced after verification and your confirmation.")
+            return
+
+        self.lossless_label.pack_forget()
+        self.truehd_panel.grid_remove()
+        self.bitrate_combo.config(state="readonly")
+        self.mode_note.config(text="The original MKV will be updated in place. All other streams are preserved.")
         if "E-AC-3" in codec:
             # E-AC-3 supports higher bitrates and is more efficient
             bitrates = ["192k", "224k", "256k", "320k", "384k", "448k", "512k", "640k", "768k"]
@@ -217,6 +385,50 @@ class ConverterApp:
                 self.bitrate_var.set("384k")
 
         self.bitrate_combo.config(values=bitrates)
+
+    def _update_clip_state(self):
+        state = "readonly" if self.test_clip_var.get() else "disabled"
+        self.clip_length_combo.config(state=state)
+        self.clip_start_entry.config(state="normal" if self.test_clip_var.get() else "disabled")
+
+    def _selected_stream(self):
+        index = self.track_combo.current()
+        if 0 <= index < len(self.audio_streams):
+            return self.audio_streams[index]
+        return None
+
+    def _truehd_problems(self):
+        stream = self._selected_stream()
+        if stream is None:
+            return ["Choose an audio track to convert."]
+        if self.encoder_checking:
+            return ["The TrueHD encoder is still being checked."]
+        return validate_source(stream, self.encoder_report)
+
+    def _refresh_truehd_compat(self):
+        """Show whether the selected track can be converted to TrueHD."""
+        if self._is_truehd():
+            stream = self._selected_stream()
+            problems = self._truehd_problems()
+            if stream is None:
+                self.compat_label.config(text="", fg="#333333")
+            elif problems:
+                self.compat_label.config(text="✗ " + problems[0], fg="#b00020")
+            else:
+                text = (f"✓ {stream.format_name} {LAYOUT_LABELS[stream.channel_layout]} "
+                        f"({stream.channel_count} ch, {stream.sample_rate} Hz, "
+                        f"{stream.bit_depth or '?'}-bit) → Dolby TrueHD "
+                        f"{LAYOUT_LABELS[stream.channel_layout]}, lossless")
+                for warning in source_warnings(stream):
+                    text += f"\n⚠ {warning}"
+                self.compat_label.config(text=text, fg="#1b7f2a")
+        self._refresh_convert_state()
+
+    def _refresh_convert_state(self):
+        ready = not self.busy and self._selected_stream() is not None
+        if ready and self._is_truehd():
+            ready = not self._truehd_problems()
+        self.convert_button.config(state="normal" if ready else "disabled")
 
     def _detect_audio(self):
         """Detect audio streams in the selected file."""
@@ -234,8 +446,7 @@ class ConverterApp:
 
         def detect():
             try:
-                streams = get_audio_streams(self.current_file, self.ffmpeg_path)
-                self.audio_streams = streams
+                streams = get_audio_streams(self.current_file, self.ffmpeg_path, self.ffprobe_path)
 
                 # Update audio display
                 self.root.after(0, lambda: self._update_audio_display(streams))
@@ -250,32 +461,46 @@ class ConverterApp:
 
     def _update_audio_display(self, streams):
         """Update audio streams display on main thread."""
+        self.audio_streams = streams
         self.audio_text.config(state="normal")
         self.audio_text.delete(1.0, END)
         if streams:
             for stream in streams:
                 self.audio_text.insert(END, f"{str(stream)}\n")
             self.track_combo.config(values=[str(stream) for stream in streams], state="readonly")
-            self.track_combo.current(0)
-            self.convert_button.config(state="normal")
+            # Pre-select the first DTS-HD MA track when one exists.
+            preferred = next((i for i, s in enumerate(streams)
+                              if s.format_name and s.format_name.startswith(("DTS-HD Master", "DTS:X"))), 0)
+            self.track_combo.current(preferred)
         else:
             self.audio_text.insert(END, "No audio streams found")
             self.track_combo.config(values=(), state="disabled")
             self.track_var.set("")
         self.audio_text.config(state="disabled")
+        self._refresh_truehd_compat()
 
     def _update_audio_display_error(self, error_msg):
         """Update audio display with error message on main thread."""
+        self.audio_streams = []
         self.audio_text.config(state="normal")
         self.audio_text.delete(1.0, END)
         self.audio_text.insert(END, f"Error: {error_msg}")
         self.audio_text.config(state="disabled")
         self.track_combo.config(values=(), state="disabled")
         self.track_var.set("")
+        self._refresh_truehd_compat()
 
     def _warn_about_removal(self):
         """Explain the consequence of removing the source audio track."""
         if self.remove_source_var.get():
+            if self._is_truehd():
+                messagebox.showwarning(
+                    "Original track will be removed",
+                    "The selected original audio track will not be included in the new MKV.\n\n"
+                    "Your source MKV is not modified unless you also choose to replace it "
+                    "and confirm after verification."
+                )
+                return
             messagebox.showwarning(
                 "Original track will be removed",
                 "The selected original audio track will be removed from the updated MKV "
@@ -283,6 +508,142 @@ class ConverterApp:
                 "The app writes a temporary file first, but once conversion succeeds the "
                 "source MKV is replaced. Keep this option off to retain the original track."
             )
+
+    # ------------------------------------------------------------------
+    # TrueHD encoder configuration
+    # ------------------------------------------------------------------
+
+    def _check_truehd_encoder(self):
+        if self.encoder_checking or self.busy:
+            return
+        self.encoder_checking = True
+        self.encoder_status_label.config(text="Checking encoder...", fg="#555555")
+        self.speaker_test_button.config(state="disabled")
+        self._refresh_truehd_compat()
+        configured = get_setting("truehd_encoder_path")
+
+        def worker():
+            try:
+                report = check_encoder(configured, reference_decoder=self.ffmpeg_path, log=self._log)
+            except Exception as e:  # never leave the UI stuck in "checking"
+                report = None
+                self._log(f"TrueHD encoder check failed: {e}")
+            self._ui(self._apply_encoder_report, report)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_encoder_report(self, report):
+        self.encoder_checking = False
+        self.encoder_report = report
+        if report is None:
+            self.encoder_status_label.config(text=STATUS_NOT_VERIFIED, fg=STATUS_COLOURS[STATUS_NOT_VERIFIED])
+            self.encoder_detail_label.config(text="The encoder check did not complete.")
+        else:
+            self.encoder_status_label.config(text=report.status, fg=STATUS_COLOURS.get(report.status, "#555555"))
+            location = f"{report.path} ({report.origin})" if report.path else "not configured"
+            self.encoder_detail_label.config(text=f"{location}\n{report.message}")
+            self._log(f"{report.status}: {report.message}")
+            if not self.ffprobe_path:
+                self.ffprobe_path = find_ffprobe(report.path)
+                if self.ffprobe_path and self.current_file:
+                    self._detect_audio()   # re-probe with full stream details
+            if report.can_encode("7.1"):
+                self.speaker_test_button.config(state="normal")
+        self._refresh_truehd_compat()
+
+    def _browse_encoder(self):
+        filetypes = [("Executables", "*.exe"), ("All files", "*.*")] if os.name == "nt" else [("All files", "*")]
+        path = filedialog.askopenfilename(title="Select LibreMPEG ffmpeg executable", filetypes=filetypes)
+        if not path:
+            return
+        set_setting("truehd_encoder_path", path)
+        self._log(f"TrueHD encoder set to: {path}")
+        self._check_truehd_encoder()
+
+    def _create_speaker_test(self):
+        report = self.encoder_report
+        if not report or not report.can_encode("7.1"):
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save TrueHD 7.1 speaker test", defaultextension=".mkv",
+            initialfile="TrueHD_7.1_Speaker_Test.mkv", filetypes=[("MKV files", "*.mkv")])
+        if not path:
+            return
+        if os.path.exists(path):
+            # The save dialog already asked to overwrite; still never overwrite silently.
+            if not messagebox.askyesno("Replace file", f"{Path(path).name} exists. Replace it?"):
+                return
+            os.unlink(path)
+        self._set_busy(True, indeterminate=True)
+        self._log("Creating TrueHD 7.1 speaker identification test file...")
+
+        def worker():
+            try:
+                create_channel_test_file(report.path, path, video_ffmpeg=self.ffmpeg_path, log=self._log)
+                self._ui(messagebox.showinfo, "Speaker test created",
+                         f"Created and verified:\n{path}\n\nEach speaker plays in turn: "
+                         "1 pip Front Left, 2 Centre, 3 Front Right, 4 Surround Right, "
+                         "5 Surround Back Right, 6 Surround Back Left, 7 Surround Left, "
+                         "8 Subwoofer (LFE). Subtitles name each speaker.")
+            except (TrueHDError, OSError) as e:
+                self._log(f"Error: {e}")
+                self._ui(messagebox.showerror, "Speaker test failed", str(e))
+            finally:
+                self._ui(self._set_busy, False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Conversion
+    # ------------------------------------------------------------------
+
+    def _set_busy(self, busy, indeterminate=True):
+        self.busy = busy
+        self.cancel_button.config(state="normal" if busy and self.job_handle else "disabled")
+        if busy:
+            self.progress.config(mode="indeterminate" if indeterminate else "determinate", value=0)
+            if indeterminate:
+                self.progress.start()
+        else:
+            self.progress.stop()
+            self.progress.config(mode="determinate", value=0)
+            self.progress_label.config(text="")
+            self.job_handle = None
+        self._refresh_convert_state()
+
+    def _show_progress(self, phase, fraction, detail):
+        """Progress update from a worker (runs on main thread)."""
+        if fraction is None:
+            if str(self.progress.cget("mode")) != "indeterminate":
+                self.progress.config(mode="indeterminate")
+                self.progress.start()
+            text = phase
+        else:
+            if str(self.progress.cget("mode")) != "determinate":
+                self.progress.stop()
+                self.progress.config(mode="determinate")
+            self.progress.config(value=fraction * 100)
+            text = f"{phase}: {fraction * 100:.1f}%"
+        if detail:
+            text += f" • {detail}"
+        self.progress_label.config(text=text)
+
+    def _cancel_job(self):
+        if self.job_handle and messagebox.askyesno("Cancel", "Cancel the running conversion?\n\n"
+                                                   "The original MKV will not be changed."):
+            self._log("Cancelling...")
+            threading.Thread(target=self.job_handle.cancel, daemon=True).start()
+
+    def _on_close(self):
+        if self.busy and self.job_handle:
+            if not messagebox.askyesno("Conversion running",
+                                       "A conversion is running. Cancel it and quit?\n\n"
+                                       "The original MKV will not be changed."):
+                return
+            self.job_handle.cancel()     # stops FFmpeg
+            if self.job_thread:
+                self.job_thread.join(timeout=15)   # let the worker delete its temp file
+        self.root.destroy()
 
     def _start_conversion(self):
         """Start the conversion process."""
@@ -306,6 +667,10 @@ class ConverterApp:
             messagebox.showwarning("Warning", "Choose an audio track to convert")
             return
 
+        if self._is_truehd():
+            self._start_truehd_conversion(input_path, self.audio_streams[selected_track])
+            return
+
         bitrate = self.bitrate_var.get()
         codec_choice = self.codec_var.get()
         codec = "eac3" if "E-AC-3" in codec_choice else "ac3"
@@ -321,8 +686,9 @@ class ConverterApp:
         ):
             return
 
-        self.convert_button.config(state="disabled")
-        self.progress.start()
+        self.job_handle = ProcessHandle()
+        handle = self.job_handle
+        self._set_busy(True)
 
         input_file = Path(input_path).name
         self._log(f"========================================")
@@ -345,37 +711,186 @@ class ConverterApp:
                     len(self.audio_streams),
                     codec=codec,
                     remove_source_stream=remove_source,
-                    progress_callback=self._log
+                    progress_callback=self._log,
+                    handle=handle,
                 )
-
-                self.progress.stop()
-                self.convert_button.config(state="normal")
 
                 if result:
                     self._log(f"========================================")
                     self._log("✓ Conversion completed successfully!")
                     self._log(f"  Updated: {input_file}")
                     self._log(f"========================================")
-                    messagebox.showinfo(
-                        "Success",
-                        f"Conversion completed successfully.\n\nUpdated MKV:\n{input_path}"
-                    )
+                    self._ui(messagebox.showinfo, "Success",
+                             f"Conversion completed successfully.\n\nUpdated MKV:\n{input_path}")
+                    self._ui(self._detect_audio)
                 else:
                     self._log("✗ Conversion failed")
-                    messagebox.showerror("Error", "Conversion failed")
+                    self._ui(messagebox.showerror, "Error", "Conversion failed")
 
+            except ConversionCancelled:
+                self._log("Conversion cancelled - the original MKV was not changed")
             except RuntimeError as e:
-                self.progress.stop()
-                self.convert_button.config(state="normal")
                 self._log(f"Error: {str(e)}")
-                messagebox.showerror("Conversion Error", str(e))
+                self._ui(messagebox.showerror, "Conversion Error", str(e))
+            finally:
+                self._ui(self._set_busy, False)
 
-        thread = threading.Thread(target=convert, daemon=True)
-        thread.start()
+        self.job_thread = threading.Thread(target=convert, daemon=True)
+        self.job_thread.start()
+
+    def _start_truehd_conversion(self, input_path, stream):
+        problems = self._truehd_problems()
+        if problems:
+            messagebox.showerror("Cannot convert to TrueHD", "\n\n".join(problems))
+            return
+        if not self.ffprobe_path:
+            messagebox.showerror("ffprobe required", "TrueHD conversion needs ffprobe for verification. "
+                                 "Place ffprobe next to the LibreMPEG or FFmpeg executable.")
+            return
+
+        test_clip = self.test_clip_var.get()
+        try:
+            clip_start = parse_timecode(self.clip_start_var.get()) if test_clip else 0.0
+        except ValueError as e:
+            messagebox.showerror("Invalid start time", str(e))
+            return
+        options = TrueHDOptions(
+            remove_source=self.remove_source_var.get(),
+            make_default=self.make_default_var.get(),
+            strict_verify=self.strict_verify_var.get(),
+            test_clip=test_clip,
+            clip_seconds=int(self.clip_length_var.get().split()[0]),
+            clip_start=clip_start,
+            replace_original=(self.output_mode_var.get() == "replace" and not test_clip),
+        )
+
+        target = output_name(Path(input_path), options.clip_seconds if test_clip else None)
+        if test_clip:
+            summary = (f"A {options.clip_seconds}-second test clip will be saved as a new file:\n"
+                       f"{target.name}\n\nThe original MKV is never modified in test mode.")
+        elif options.replace_original:
+            summary = ("A verified copy will be created first. You will then be asked whether to "
+                       "replace the original MKV with it.")
+        else:
+            summary = f"A new MKV will be created:\n{target.name}\n\nThe original MKV is not modified."
+        if not options.strict_verify:
+            summary += "\n\nStrict lossless verification is OFF: the result will not be checked sample-by-sample."
+        if not messagebox.askyesno("Convert to Dolby TrueHD", summary + "\n\nContinue?"):
+            return
+
+        report = self.encoder_report
+        self.job_handle = ProcessHandle()
+        handle = self.job_handle
+        self._set_busy(True, indeterminate=True)
+
+        converter = TrueHDConverter(
+            encoder=report.path, ffprobe=self.ffprobe_path, reference_ffmpeg=self.ffmpeg_path,
+            report=report, log=self._log,
+            progress=lambda phase, fraction, detail: self._ui(self._show_progress, phase, fraction, detail),
+            handle=handle,
+        )
+
+        def worker():
+            try:
+                result = converter.convert(input_path, stream.stream_index, options)
+                self._ui(self._finish_truehd, converter, result)
+            except ConversionCancelled:
+                self._log("Conversion cancelled - the original MKV was not changed")
+                self._ui(self._set_busy, False)
+            except (TrueHDError, RuntimeError, OSError) as e:
+                self._log(f"✗ {e}")
+                self._ui(messagebox.showerror, "TrueHD conversion failed", str(e))
+                self._ui(self._set_busy, False)
+
+        self.job_thread = threading.Thread(target=worker, daemon=True)
+        self.job_thread.start()
+
+    def _finish_truehd(self, converter, result):
+        """Runs on the main thread once encoding and verification succeeded."""
+        try:
+            if result.awaiting_replace_confirmation:
+                if messagebox.askyesno(
+                    "Replace original MKV?",
+                    "Conversion and verification passed.\n\n"
+                    f"Replace the original file\n{Path(result.source_path).name}\n"
+                    "with the verified version? This cannot be undone.\n\n"
+                    f"Choose No to keep the original and save as\n{Path(result.final_path).name}",
+                    icon="warning",
+                ):
+                    try:
+                        converter.finalize_replace(result)
+                        self._log("Original MKV replaced with verified TrueHD version")
+                    except OSError as e:
+                        # e.g. the file is open in Plex or another player (Windows locks it)
+                        converter.finalize_as_new(result)
+                        self._log(f"Could not replace the original ({e}); saved as a new file instead")
+                        messagebox.showwarning(
+                            "Original not replaced",
+                            f"The original MKV could not be replaced:\n{e}\n\n"
+                            "It may be open in another program. The verified result was saved as:\n"
+                            f"{result.final_path}")
+                else:
+                    converter.finalize_as_new(result)
+        except (TrueHDError, OSError) as e:
+            converter.discard(result)
+            self._set_busy(False)
+            self._log(f"✗ {e}")
+            messagebox.showerror("Could not save output", f"{e}\n\nThe original MKV was not changed.")
+            return
+
+        self._set_busy(False)
+        lossless = {True: "Verified bit-identical to the source audio",
+                    False: "NOT verified", None: "Not checked (strict verification was off)"}[result.lossless]
+        self._log("========================================")
+        self._log("✓ TrueHD conversion complete" + (" (test clip)" if result.clip else ""))
+        self._log(f"  Output: {result.final_path}")
+        self._log(f"  Lossless: {lossless}")
+        self._log("========================================")
+        messagebox.showinfo(
+            "TrueHD conversion complete",
+            f"Saved:\n{result.final_path}\n\n"
+            f"All {len(result.checks)} output checks passed.\n"
+            f"Lossless: {lossless}"
+            + ("\n\nThis is a test clip - play it in Plex and check your receiver "
+               "shows Dolby TrueHD with 7.1 channels." if result.clip else "")
+        )
+        if result.final_path == result.source_path:
+            self._detect_audio()
+
+
+def run_self_test(report_path: str) -> int:
+    """Headless check used by the Windows build after installing.
+
+    Writes a JSON report and returns 0 only when the bundled FFmpeg is found
+    and the TrueHD encoder passes its self-test. Never downloads anything.
+    """
+    import json
+    from dataclasses import asdict
+    from app_paths import app_dir
+
+    ffmpeg = get_ffmpeg_path()
+    report = check_encoder(get_setting("truehd_encoder_path"), reference_decoder=ffmpeg)
+    data = {
+        "version": __version__,
+        "app_dir": str(app_dir()),
+        "ffmpeg": ffmpeg,
+        "ffprobe": find_ffprobe(ffmpeg, report.path),
+        "encoder": report.path,
+        "encoder_origin": report.origin,
+        "status": report.status,
+        "message": report.message,
+        "tests": [asdict(t) for t in report.tests],
+    }
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    ok = bool(ffmpeg and data["ffprobe"]) and report.status == STATUS_READY
+    return 0 if ok else 1
 
 
 def main():
     """Main entry point."""
+    if len(sys.argv) == 3 and sys.argv[1] == "--self-test":
+        sys.exit(run_self_test(sys.argv[2]))
     root = Tk()
     app = ConverterApp(root)
     root.mainloop()
