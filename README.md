@@ -1,266 +1,261 @@
-# DTS to Dolby Digital (AC-3) MKV Converter
+# DTS2DD - DTS to Dolby MKV Converter
 
-A cross-platform Python application with a simple GUI for converting DTS audio in MKV files to Dolby Digital (AC-3), Dolby Digital Plus (E-AC-3), or lossless **Dolby TrueHD** (from DTS-HD Master Audio).
+A Windows and macOS desktop app that adds a Dolby audio track to MKV files
+that only have DTS audio:
+
+- **Dolby Digital (AC-3)** or **Dolby Digital Plus (E-AC-3)** from any DTS track
+- **Dolby TrueHD (lossless)** from DTS-HD Master Audio 5.1 or 7.1, bit-for-bit
+
+Video, subtitles, chapters and other tracks are copied untouched; only the
+new audio track is encoded.
 
 ## Features
 
-- **Automatic FFmpeg Detection & Download**: The application automatically detects FFmpeg on startup. If not found, it downloads the appropriate version for your platform.
-- **Audio Stream Detection**: Displays all audio streams in the selected MKV file with codec, channels, bitrate, and language information.
-- **Simple GUI**: Easy-to-use tkinter interface for file selection and conversion settings.
-- **Cross-Platform**: Works on macOS and Windows.
-- **Flexible Bitrate Selection**: Choose AC-3 bitrate (192k to 640k) for output.
-- **Progress Indication**: Visual feedback during conversion process.
-- **Lossless Dolby TrueHD (new)**: Adds a Dolby TrueHD 5.1/7.1 track converted bit-for-bit from DTS-HD Master Audio, using a separately configured LibreMPEG encoder. Video and all other tracks are copied untouched. See [Dolby TrueHD](#dolby-truehd-lossless) below.
-
-## Requirements
-
-- **Python 3.11+** (tkinter included)
-- **py7zr**: For extracting FFmpeg on macOS (automatically installed via requirements.txt)
+- **Three output formats**: AC-3 (192k-640k), E-AC-3 (192k-768k), and
+  lossless Dolby TrueHD 5.1/7.1.
+- **Accurate track detection**: reads every audio track with ffprobe and
+  identifies DTS, DTS-HD High Resolution, DTS-HD Master Audio, DTS:X,
+  Dolby TrueHD (and Atmos), Dolby Digital and Dolby Digital Plus, plus
+  channel layout, sample rate, bit depth, language, title and default/forced
+  flags. Unrecognised formats are shown as "Unknown" rather than guessed.
+- **Safe file handling**: everything is written to a temporary file first;
+  the original is only changed after a successful, checked conversion.
+- **Progress and control**: percentage, speed and time remaining for TrueHD
+  conversions, a Cancel button, and an activity log with the real FFmpeg
+  error when something fails.
+- **Self-contained Windows installer**: FFmpeg and the TrueHD encoder are
+  included, so there is nothing else to install or configure.
 
 ## Installation
 
-**Windows:** run `DTS2DD-Setup-<version>.exe` (from the GitHub Actions
-artifact or a GitHub release), click Install, done. FFmpeg and the TrueHD
-encoder are included. The installer is unsigned, so SmartScreen may ask you to
-click "More info" -> "Run anyway". See BUILD_AND_DISTRIBUTE.md for how it is built.
+### Windows (recommended)
 
-**From source:**
+1. Download `DTS2DD-Setup-<version>.exe` from the
+   [Releases](https://github.com/tjsDangermouse/DTS2DD/releases) page, or
+   from the **Artifacts** of the latest successful
+   [Windows installer](https://github.com/tjsDangermouse/DTS2DD/actions)
+   build.
+2. Run it. The installer is not code-signed, so Windows may show "Windows
+   protected your PC": click **More info**, then **Run anyway**.
+3. Click **Install**, then **Finish**. The app opens; afterwards start it from
+   the Start menu or desktop shortcut.
 
-1. Clone or download this repository
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+No administrator rights are needed. The app installs to
+`%LOCALAPPDATA%\Programs\DTS2DD` and can be removed from Settings → Apps.
 
-## Usage
+### macOS / from source
 
-### Running the Application
+Requires Python 3.11+ (with tkinter).
 
 ```bash
+git clone https://github.com/tjsDangermouse/DTS2DD.git
+cd DTS2DD
+pip install -r requirements.txt
 python3 converter.py
 ```
 
-On first run, the application will:
-1. Check for FFmpeg in the system PATH
-2. If not found, automatically download and extract FFmpeg to the `./ffmpeg/` directory
-3. Display a progress dialog during download (macOS only)
-4. Launch the main application window
+To build a macOS app bundle instead, run `./build_macos.sh` (output:
+`dist/DTS to AC-3 Converter.app`).
 
-### Converting a File
+When run this way the app uses FFmpeg from your PATH (e.g.
+`brew install ffmpeg`) or downloads it on first run into your user folder
+(`~/Library/Application Support/DTS2DD/ffmpeg`). TrueHD additionally needs a
+LibreMPEG build you provide - see [Dolby TrueHD](#dolby-truehd-lossless).
 
-1. **Select Input File**: Click "Browse" in the "Input File" section to select an MKV file
-2. **Detect Audio**: Click "Detect Audio" to scan for audio streams in the file
-3. **Configure conversion**:
-   - Choose the source audio track to convert
-   - Select the audio codec and bitrate
-   - Optionally remove the selected original track (off by default)
-4. **Convert**: Click "Convert" to append the converted track to the selected MKV
-5. The progress bar will show activity during conversion
-6. A success message will appear when complete
+## Usage
 
-The application writes a temporary MKV in the same folder and replaces the
-source file only after FFmpeg completes successfully. All existing streams are
-preserved by default; enabling removal omits only the selected original audio track.
+1. Click **Browse** and choose an MKV file. Its audio tracks are detected
+   automatically (use **Detect Audio** to re-scan).
+2. Choose the track to convert. The first DTS-HD MA track is pre-selected.
+3. Choose the **Audio Codec**:
+   - **AC-3** or **E-AC-3**: pick a bitrate. The converted track is appended
+     and the original MKV is **updated in place** after you confirm.
+   - **Dolby TrueHD (Lossless)**: no bitrate to choose. A new file is saved
+     beside the original by default - see below.
+4. Optionally tick **Remove the original selected audio track** (off by
+   default).
+5. Click **Convert**.
 
 ## Dolby TrueHD (Lossless)
 
-Choose **Dolby TrueHD (Lossless)** as the codec to append a TrueHD copy of a
-DTS-HD MA 5.1 or 7.1 track - useful when a player (e.g. Fire TV Stick 4K Plus)
-passes TrueHD to the receiver but only the lossy core of DTS-HD MA.
+Adds a Dolby TrueHD copy of a DTS-HD MA 5.1 or 7.1 track. This is useful when
+a player (e.g. a Fire TV Stick 4K Plus) passes TrueHD to the receiver but only
+the lossy core of DTS-HD MA.
 
-- **Lossless and verified**: DTS-HD MA (lossless XLL decode) -> integer PCM ->
-  TrueHD in one pass, no filters. Strict mode (on by default) decodes the
+- **Lossless and verified**: DTS-HD MA (lossless decode) -> integer PCM ->
+  TrueHD, with no filters. Strict verification (on by default) decodes the
   original and the new track and confirms every sample is identical.
-- **Channels preserved**: 7.1 stays 7.1, 5.1 stays 5.1. Unsupported layouts
-  (7.1 "wide", 6.1, 5.1 with rear surrounds) and lossy DTS are refused, never
-  converted approximately.
-- **Not Atmos**: TrueHD 7.1 is channel-based; no object/height metadata is
-  added and the track is titled e.g. "Dolby TrueHD 7.1".
-- **Safe output**: saves `Film_Sound_TrueHD.mkv` by default; replacing the
-  original is optional and only offered after all checks pass. The original
-  DTS-HD MA track is kept unless you choose to remove it.
-- **Video untouched**: stream copy only; HEVC, HDR10 and Dolby Vision
-  (profile 7/8) configuration and packet data are checked after conversion.
-- **Test clip mode**: 30/60/120-second clips for checking Plex / receiver
-  playback before converting a whole film.
-- **Encoder**: [LibreMPEG](https://github.com/librempeg/librempeg) (standard
-  FFmpeg cannot encode TrueHD 7.1). It is self-tested on every start; no
-  binary is downloaded automatically. See USER_GUIDE.md for setup and
-  BUILD_AND_DISTRIBUTE.md for building it and its AGPL licence.
+- **Channels preserved**: 7.1 stays 7.1 and 5.1 stays 5.1. Unsupported
+  layouts (7.1 "wide", 6.1, 5.1 with rear surrounds) and lossy DTS formats
+  are refused rather than converted approximately.
+- **Not Atmos**: TrueHD 7.1 is channel-based. No height or object metadata is
+  added, and the track is titled e.g. "Dolby TrueHD 7.1".
+- **Safe output**: saves `Film_Sound_TrueHD.mkv` by default and never
+  overwrites an existing file. Replacing the original is optional and only
+  offered after every check has passed. The original DTS-HD MA track is kept
+  unless you choose to remove it.
+- **Video untouched**: stream copy only. Video format, HDR10 and Dolby Vision
+  (profile 7/8) settings and video packet data are checked after conversion.
+- **Test clip mode**: make a 30/60/120-second clip to check playback on your
+  TV and receiver before converting a whole film.
+- **Speaker test file**: a TrueHD 7.1 file that plays each speaker in turn,
+  to confirm no channels are swapped on your system.
+- **Encoder**: [LibreMPEG](https://github.com/librempeg/librempeg), because
+  standard FFmpeg cannot encode TrueHD 7.1. The Windows installer includes a
+  build made from a verified source commit. The app self-tests the encoder on
+  every start and only allows TrueHD conversion once it passes.
 
-Playback on Plex / Fire TV / AV receivers has **not** been verified by
-automated tests - see "Testing on Fire TV / Plex / Denon" in USER_GUIDE.md.
-
-### Tests
-
-```bash
-python tests/fetch_samples.py      # FATE DTS-HD MA + Dolby Vision samples (~7 MB)
-DTS2DD_LIBREMPEG=/path/to/librempeg/ffmpeg python -m pytest tests -v
-```
-
-## File Structure
-
-```
-dts_to_ac3_converter/
-├── converter.py              # Main application GUI
-├── ffmpeg_downloader.py      # FFmpeg auto-detection and download
-├── ffmpeg_helper.py          # FFmpeg subprocess management
-├── audio_stream_info.py      # Audio stream data model
-├── media_probe.py            # ffprobe JSON probing, format identification, video checks
-├── truehd_encoder.py         # LibreMPEG discovery, self-test, TrueHD commands
-├── truehd_workflow.py        # TrueHD conversion, verification, safe output
-├── app_settings.py           # Persistent settings (LibreMPEG path)
-├── tests/                    # Unit + integration tests
-├── requirements.txt          # Python dependencies
-└── ffmpeg/                   # Auto-created, contains downloaded FFmpeg
-    └── ffmpeg (or ffmpeg.exe on Windows)
-```
+Playback on Plex, Fire TV and AV receivers has **not** been verified by
+automated tests. See "Testing on Fire TV / Plex / Denon" in
+[USER_GUIDE.md](USER_GUIDE.md) for the manual check.
 
 ## How It Works
 
-### FFmpeg Download
+### Finding FFmpeg
 
-The application downloads platform-specific FFmpeg builds from:
-- **macOS**: https://evermeet.cx/ffmpeg/getrelease/ffmpeg/7z (static build)
-- **Windows**: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+The app looks for FFmpeg in this order:
 
-Downloaded files are extracted to the `./ffmpeg/` directory locally.
+1. The `ffmpeg` folder installed beside the app (Windows installer)
+2. Your system PATH
+3. A previous download in your user folder
+   (`%LOCALAPPDATA%\DTS2DD\ffmpeg` on Windows,
+   `~/Library/Application Support/DTS2DD/ffmpeg` on macOS)
 
-### Audio Detection
+If none is found it downloads FFmpeg into that user folder from
+[gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (Windows) or
+[evermeet.cx](https://evermeet.cx/ffmpeg/) (macOS). The app never writes into
+its own program folder. Settings are stored in `%APPDATA%\DTS2DD` (Windows)
+or `~/Library/Application Support/DTS2DD` (macOS).
 
-The application uses FFmpeg's probe functionality to scan the input file and extract:
-- Stream index and type
-- Audio codec (DTS, DTS-HD, AC-3, etc.)
-- Sample rate
-- Number of channels (5.1, 7.1, stereo, etc.)
-- Bitrate
-- Language (if available)
+### AC-3 / E-AC-3 conversion
 
-### Conversion
-
-FFmpeg command used (AC-3 / E-AC-3):
 ```
 ffmpeg -i input.mkv -map 0 -map -0:t? -map 0:[selected-stream] -map 0:t? -c copy \
   -c:a:[new-track] ac3 -b:a:[new-track] [bitrate] temporary.mkv -y
 ```
-Attachments (fonts) are mapped last: FFmpeg's Matroska muxer otherwise fails
-with "Received a packet for an attachment stream" on MKVs that contain them.
 
-This approach:
-- Copies all existing streams, then appends the selected source track as AC-3/Dolby Digital
-- Replaces the source MKV only after the temporary conversion succeeds
+All streams are copied and the selected track is appended a second time as
+AC-3 or E-AC-3. Attachments (such as subtitle fonts) are mapped last, because
+FFmpeg's Matroska writer otherwise fails on files that contain them. The
+temporary file replaces the original only after FFmpeg succeeds.
+
+### TrueHD conversion
+
+The exact LibreMPEG command, encoder findings and verification steps are
+documented in [BUILD_AND_DISTRIBUTE.md](BUILD_AND_DISTRIBUTE.md#librempeg-for-truehd).
 
 ## Troubleshooting
 
-### FFmpeg Download Fails
+### Windows says "Windows protected your PC"
 
-**Symptom**: Application shows error about FFmpeg download failing
+The installer is not code-signed. Click **More info**, then **Run anyway**.
 
-**Solutions**:
-1. Check your internet connection
-2. Try manual installation:
-   - **macOS**: `brew install ffmpeg`
-   - **Windows**: Download from https://www.gyan.dev/ffmpeg/builds/ and add to PATH
+### TrueHD encoder status is not "ready"
 
-### No Audio Streams Detected
+- **TrueHD encoder missing**: no LibreMPEG was found. On Windows, reinstall
+  with the installer; from source, use **Browse...** to select a LibreMPEG
+  `ffmpeg`.
+- **TrueHD 7.1 unsupported**: the selected executable is standard FFmpeg,
+  which cannot encode TrueHD 7.1.
+- **TrueHD encoder not verified**: the self-test failed; the line underneath
+  says why.
 
-**Symptom**: "Detect Audio" shows "No audio streams found"
+### TrueHD option says the track cannot be converted
 
-**Solutions**:
-1. Verify the file is a valid MKV container
-2. Ensure the file contains audio streams
-3. Try opening the file with a media player to confirm it's valid
+Only DTS-HD Master Audio 5.1 (side surrounds) and 7.1 tracks can be converted
+losslessly. The message under the encoder status explains the specific reason.
 
-### AC-3 Codec Not Available
+### FFmpeg download fails (macOS / from source)
 
-**Symptom**: Conversion fails with error about AC-3 encoding
+Check your internet connection, or install FFmpeg yourself:
 
-**Solutions**:
-1. Verify FFmpeg installation: `ffmpeg -codecs | grep ac3`
-2. If AC-3 is not available, reinstall FFmpeg or check your build includes AC-3 support
+- **macOS**: `brew install ffmpeg`
+- **Windows**: download from https://www.gyan.dev/ffmpeg/builds/ and add its
+  `bin` folder to PATH
 
-### Permission Errors
+### No audio streams detected
 
-**Symptom**: "Permission denied" when writing output file
+Check that the file is a valid MKV with audio by opening it in a media player.
 
-**Solutions**:
-1. Verify output directory is writable
-2. Check disk space available
-3. Close any applications that might have the file locked
+### Permission or disk-space errors
 
-## Advanced: Manual FFmpeg Installation
+The app writes a temporary file next to the original, so that folder must be
+writable and have enough free space. A TrueHD conversion checks the space
+first and stops with a message if there is not enough. Close any program that
+has the file open, such as a player or a Plex library scan.
 
-If you prefer not to use auto-download, install FFmpeg manually:
+## Development
 
-**macOS (using Homebrew)**:
 ```bash
-brew install ffmpeg
+pip install pytest
+python tests/fetch_samples.py      # FFmpeg FATE DTS-HD MA + Dolby Vision samples (~7 MB)
+DTS2DD_LIBREMPEG=/path/to/librempeg/ffmpeg python -m pytest tests -v
 ```
 
-**Windows**:
-1. Download from https://www.gyan.dev/ffmpeg/builds/
-2. Extract to a directory
-3. Add to PATH environment variable
+Unit tests need nothing else. Integration tests skip unless LibreMPEG,
+FFmpeg, ffprobe and the samples are available. The Windows installer is built
+and tested on Windows by GitHub Actions on every push
+(`.github/workflows/windows-installer.yml`). See
+[BUILD_AND_DISTRIBUTE.md](BUILD_AND_DISTRIBUTE.md) for building locally and
+releasing.
 
-The application will detect FFmpeg in your system PATH automatically.
+## File Structure
 
-## Supported Audio Codecs (Input)
-
-The application can detect and display all audio codecs:
-- DTS (DTS, DTS-HD)
-- AC-3 (Dolby Digital)
-- E-AC-3 (Dolby Digital Plus)
-- AAC
-- MP3
-- FLAC
-- OPUS
-- And others supported by FFmpeg
-
-## Output Codec
-
-- **AC-3 (Dolby Digital)** - Selectable bitrates: 192k, 224k, 256k, 320k, 384k, 448k, 640k
-- **E-AC-3 (Dolby Digital Plus)** - Selectable bitrates up to 768k
-- **Dolby TrueHD** - Lossless, from DTS-HD MA 5.1 / 7.1 only (requires LibreMPEG)
+```
+DTS2DD/
+├── converter.py              # GUI (tkinter) and --self-test entry point
+├── ffmpeg_helper.py          # FFmpeg commands, process runner, AC-3/E-AC-3 workflow
+├── ffmpeg_downloader.py      # FFmpeg discovery and download
+├── media_probe.py            # ffprobe JSON probing, format identification, video checks
+├── truehd_encoder.py         # LibreMPEG discovery, self-test, TrueHD commands
+├── truehd_workflow.py        # TrueHD conversion, verification, safe output
+├── audio_stream_info.py      # Audio stream data model
+├── app_paths.py              # Program and per-user folders
+├── app_settings.py           # Persistent settings
+├── version.py                # App version
+├── converter.spec            # PyInstaller configuration
+├── build_windows.bat         # Local Windows build (app folder + installer)
+├── build_macos.sh            # macOS app bundle build
+├── installer/                # Inno Setup script and third-party notices
+├── .github/workflows/        # Windows installer build and tests
+├── tests/                    # Unit and integration tests
+├── icons/                    # App icons
+└── requirements.txt          # Python dependencies
+```
 
 ## Platform Notes
 
-### macOS
-- Tested on macOS 12+
-- Uses system Python or brew-installed Python
-- FFmpeg downloads from evermeet.cx (static builds)
-
-### Windows
-- Tested on Windows 10+
-- Python 3.11+ from python.org
-- FFmpeg downloads from gyan.dev
+- **Windows 10/11 (64-bit)**: use the installer. It is built and tested by
+  GitHub Actions on Windows Server; testing on a home PC is still to be done.
+- **macOS**: run from source or build the app bundle. TrueHD needs a
+  LibreMPEG build you provide.
 
 ## Performance
 
-- Audio stream detection: 1-2 seconds for typical MKV files
-- Conversion speed depends on:
-  - File size
-  - CPU performance
-  - Output bitrate
-  - Input codec complexity
-
-For a 5GB file with DTS 5.1 audio, conversion typically takes 3-10 minutes on modern hardware.
+- Track detection takes a second or two.
+- AC-3/E-AC-3 and TrueHD conversions read and write the whole MKV, so large
+  films are mostly limited by disk speed.
+- In testing on an Apple-silicon Mac, TrueHD encoding ran at about 44x real
+  time. Strict verification takes roughly as long again.
 
 ## Future Enhancements
 
-Possible improvements for future versions:
-- Batch processing multiple files
-- Preview audio player
-- Support for other output codecs (E-AC-3, AAC)
-- Preserve multiple audio streams
-- Advanced FFmpeg options (downmixing, filtering)
+- Batch processing of multiple files
+- Drag-and-drop file selection
+- Code-signed installer (removes the SmartScreen warning)
 
 ## License
 
-This project uses FFmpeg which is licensed under the LGPL license.
+This project does not yet have a licence file, so the code is published but
+all rights are reserved.
 
-## Support
+The Windows installer includes third-party programs under their own licences,
+listed in its `licenses` folder:
 
-For issues or questions:
-1. Check the Troubleshooting section above
-2. Verify FFmpeg is working: `ffmpeg -version`
-3. Check that your MKV file is valid: `ffmpeg -i yourfile.mkv`
+- **FFmpeg** (gyan.dev build): GNU GPL v3
+- **LibreMPEG**: GNU AGPL v3 or later
+
+See [installer/THIRD_PARTY_NOTICES.txt](installer/THIRD_PARTY_NOTICES.txt).
+Dolby, Dolby TrueHD and Dolby Atmos are trademarks of Dolby Laboratories; DTS
+and DTS-HD are trademarks of DTS, Inc. This project is not affiliated with
+either.
