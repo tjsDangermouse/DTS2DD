@@ -40,8 +40,40 @@ jobs:
           path: vendor/librempeg
           key: librempeg-win64-${{ env.LIBREMPEG_COMMIT }}-${{ hashFiles('installer/patches/*.patch') }}-zlib-ucrt-v3
 
+      # MSYS2 setup occasionally fails on the runners (package mirrors / system
+      # update), so it is attempted up to three times.
       - name: Set up MSYS2
+        id: msys2-1
         if: steps.librempeg-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: msys2/setup-msys2@v2
+        with:
+          # UCRT64: MSYS2 has deprecated the MINGW64 environment. The resulting
+          # static exe only needs the Universal C Runtime built into Windows 10/11.
+          msystem: UCRT64
+          update: true
+          install: >-
+            git make diffutils
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-zlib
+
+      - name: Set up MSYS2 (retry)
+        id: msys2-2
+        if: steps.librempeg-cache.outputs.cache-hit != 'true' && steps.msys2-1.outcome == 'failure'
+        continue-on-error: true
+        uses: msys2/setup-msys2@v2
+        with:
+          # UCRT64: MSYS2 has deprecated the MINGW64 environment. The resulting
+          # static exe only needs the Universal C Runtime built into Windows 10/11.
+          msystem: UCRT64
+          update: true
+          install: >-
+            git make diffutils
+            mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-zlib
+
+      - name: Set up MSYS2 (second retry)
+        if: steps.librempeg-cache.outputs.cache-hit != 'true' && steps.msys2-1.outcome == 'failure' && steps.msys2-2.outcome == 'failure'
         uses: msys2/setup-msys2@v2
         with:
           # UCRT64: MSYS2 has deprecated the MINGW64 environment. The resulting
