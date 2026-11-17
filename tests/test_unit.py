@@ -408,6 +408,49 @@ class CommandTests(unittest.TestCase):
             self.assertIn("-c:a:1", removed)
 
 
+class TrackRemovalCommandTests(unittest.TestCase):
+    """Removing ticked audio/subtitle tracks, alone or while converting."""
+
+    def test_stream_maps_drop_ticked_tracks(self):
+        maps = ffmpeg_helper.build_stream_maps(1, False, [4, 2, 1])
+        self.assertEqual(maps, ["-map", "0", "-map", "-0:2", "-map", "-0:4",
+                                "-map", "-0:t?", "-map", "0:1", "-map", "0:t?"])
+
+    def test_ac3_index_accounts_for_removed_audio(self):
+        cmd = ffmpeg_helper.build_append_audio_command("ff", "/m/in.mkv", "/m/t.mkv", 1, 3,
+                                                       "ac3", "640k", True, [2, 5], 1)
+        self.assertIn("-0:1", cmd)
+        self.assertIn("-0:2", cmd)
+        self.assertIn("-0:5", cmd)
+        self.assertEqual(cmd[cmd.index("-c:a:1") + 1], "ac3")
+
+    def test_truehd_index_accounts_for_removed_audio(self):
+        job = te.TrueHDJob(source_path="/m/in.mkv", output_path="/m/.tmp.mkv", source_stream_index=1,
+                           audio_stream_count=3, layout="7.1", sample_fmt="s32p", sample_rate=48000,
+                           remove_streams=(2, 6), removed_other_audio=1)
+        self.assertEqual(job.new_audio_index, 2)
+        self.assertEqual(job.removed_indices, {2, 6})
+        cmd = te.build_truehd_command("enc", job)
+        self.assertIn("-0:2", cmd)
+        self.assertIn("-0:6", cmd)
+        self.assertIn("-c:a:2", cmd)
+
+    def test_remove_only_is_stream_copy(self):
+        cmd = ffmpeg_helper.build_remove_streams_command("ff", "/m/in.mkv", "/m/t.mkv", [3, 2])
+        self.assertEqual(cmd[cmd.index("-i") + 1:cmd.index("-c")],
+                         ["/m/in.mkv", "-map", "0", "-map", "-0:2", "-map", "-0:3"])
+        self.assertEqual(cmd[cmd.index("-c") + 1], "copy")
+        self.assertNotIn("-c:a", " ".join(cmd))
+
+    def test_subtitle_text_probe(self):
+        stderr = ("  Stream #0:3(eng): Subtitle: hdmv_pgs_subtitle (pgssub) (default) (forced)\n"
+                  "  Stream #0:4: Subtitle: subrip (srt)\n")
+        subs = ffmpeg_helper._parse_subtitles_text(stderr)
+        self.assertEqual([(s.stream_index, s.language, s.is_forced) for s in subs],
+                         [(3, "eng", True), (4, None, False)])
+        self.assertEqual(str(subs[0]), "PGS [eng] {default, forced}")
+
+
 class FileSafetyTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()

@@ -25,7 +25,8 @@ DTS to AC-3/DD+ Converter: A cross-platform GUI application that converts DTS au
 
 **ffmpeg_helper.py** - FFmpeg subprocess management (shared by both workflows)
 - `get_audio_streams()`: ffprobe JSON when ffprobe is found, else the original regex parse of `ffmpeg -i` stderr
-- `build_stream_maps()`: maps all streams + the selected audio again; attachments are mapped LAST (Matroska muxer fails otherwise)
+- `build_stream_maps()`: maps all streams + the selected audio again; attachments are mapped LAST (Matroska muxer fails otherwise); `remove_streams` drops ticked audio/subtitle tracks (output audio index then = audio count - removed audio)
+- `get_tracks()`: audio + subtitle lists for the GUI tick lists; `remove_streams_in_place()`: removal-only stream copy
 - `convert_and_append_audio()`: AC-3/E-AC-3 in-place workflow (temp file -> `os.replace`)
 - `run_ffmpeg()`: Popen with `-progress pipe:1`, stderr drained on a thread (last 200 lines kept for errors), cancellation via `ProcessHandle`
 

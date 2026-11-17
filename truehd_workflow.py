@@ -14,7 +14,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from audio_stream_info import AudioStreamInfo
 from ffmpeg_helper import ConversionCancelled, FFmpegProgress, ProcessHandle, run_ffmpeg
@@ -172,6 +172,7 @@ class TrueHDOptions:
     clip_seconds: int = 60
     clip_start: float = 0.0
     replace_original: bool = False   # only honoured after verification + confirmation
+    remove_streams: Tuple[int, ...] = ()   # other audio/subtitle tracks to leave out
 
 
 @dataclass
@@ -256,6 +257,15 @@ class TrueHDConverter:
 
         self._check_disk_space(source, source_probe, stream, clip_seconds)
 
+        removable = {st["index"]: st.get("codec_type") for st in source_probe.get("streams", [])
+                     if st.get("codec_type") in ("audio", "subtitle")}
+        unknown = [i for i in options.remove_streams if i not in removable]
+        if unknown:
+            raise TrueHDError(f"Tracks to remove not found in {source.name}: "
+                              + ", ".join(f"#{i}" for i in unknown))
+        remove_streams = tuple(sorted(set(options.remove_streams) - {stream.stream_index}))
+        remove_source = options.remove_source or stream.stream_index in options.remove_streams
+
         final_path = unique_path(output_name(source, clip_seconds))
         temp_path = self._make_temp(source)
         cut_path = self._make_temp(source) if clip_seconds else None
@@ -269,8 +279,10 @@ class TrueHDConverter:
             sample_fmt=stream.sample_fmt,
             sample_rate=stream.sample_rate,
             language=stream.language,
-            remove_source=options.remove_source,
+            remove_source=remove_source,
             make_default=options.make_default,
+            remove_streams=remove_streams,
+            removed_other_audio=sum(1 for i in remove_streams if removable[i] == "audio"),
         )
 
         # Strict verification fingerprints (small files in the system temp folder)
@@ -394,6 +406,8 @@ class TrueHDConverter:
         if clip_seconds:
             self.log(f"  Test clip: {clip_seconds}s from {clip_start:.3f}s")
         self.log(f"  Keep original track: {'No' if job.remove_source else 'Yes'}")
+        if job.remove_streams:
+            self.log("  Also removing tracks: " + ", ".join(f"#{i}" for i in job.remove_streams))
         self.log(f"  Make TrueHD default: {'Yes' if job.make_default else 'No'}")
         self.log(f"  Strict lossless verification: {'Yes' if options.strict_verify else 'No'}")
         self.log("========================================")
@@ -440,8 +454,8 @@ class TrueHDConverter:
 
         src_audio = streams_of_type(source_probe, "audio")
         out_audio = streams_of_type(out, "audio")
-        kept_audio = [s for s in src_audio
-                      if not (job.remove_source and s["index"] == job.source_stream_index)]
+        removed = job.removed_indices
+        kept_audio = [s for s in src_audio if s["index"] not in removed]
         checks.append(Check("Audio track count", len(out_audio) == len(kept_audio) + 1,
                             f"{len(out_audio)} (expected {len(kept_audio) + 1})"))
 
@@ -510,7 +524,8 @@ class TrueHDConverter:
                                 f"default flags on audio {[d + 1 for d in defaults]}"))
 
         for kind, label in (("subtitle", "Subtitle"), ("attachment", "Attachment")):
-            before, after = streams_of_type(source_probe, kind), streams_of_type(out, kind)
+            before = [s for s in streams_of_type(source_probe, kind) if s["index"] not in removed]
+            after = streams_of_type(out, kind)
             same = len(before) == len(after) and all(
                 b.get("codec_name") == a.get("codec_name")
                 and tag(b, "language") == tag(a, "language")
@@ -561,7 +576,7 @@ class TrueHDConverter:
         new_index = streams_of_type(out, "audio")[job.new_audio_index]["index"]
         src_streams = [st for st in source_probe.get("streams", [])
                        if st.get("codec_type") not in ("attachment", None)
-                       and not (job.remove_source and st["index"] == job.source_stream_index)]
+                       and st["index"] not in job.removed_indices]
         out_streams = [st for st in out.get("streams", [])
                        if st.get("codec_type") not in ("attachment", None) and st["index"] != new_index]
         if len(src_streams) != len(out_streams):

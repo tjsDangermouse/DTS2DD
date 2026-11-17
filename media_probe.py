@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from app_paths import ffmpeg_folders, find_tool
-from audio_stream_info import AudioStreamInfo
+from audio_stream_info import AudioStreamInfo, SubtitleStreamInfo
 
 
 def subprocess_flags() -> int:
@@ -176,6 +176,25 @@ def audio_streams_from_probe(data: Dict) -> List[AudioStreamInfo]:
         ))
         audio_index += 1
     return streams
+
+
+def subtitle_streams_from_probe(data: Dict) -> List[SubtitleStreamInfo]:
+    """Convert ffprobe JSON into SubtitleStreamInfo objects."""
+    subtitles = []
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") != "subtitle":
+            continue
+        tags = {k.lower(): v for k, v in (stream.get("tags") or {}).items()}
+        disposition = stream.get("disposition") or {}
+        subtitles.append(SubtitleStreamInfo(
+            stream_index=int(stream["index"]),
+            codec_name=stream.get("codec_name") or "unknown",
+            language=tags.get("language"),
+            title=tags.get("title"),
+            is_default=bool(disposition.get("default")),
+            is_forced=bool(disposition.get("forced")),
+        ))
+    return subtitles
 
 
 def streams_of_type(data: Dict, codec_type: str) -> List[Dict]:

@@ -7,10 +7,13 @@ from tkinter import (
     Tk, Frame, Label, Entry, Button, Text, messagebox, Radiobutton,
     filedialog, Scrollbar, StringVar, BooleanVar, Checkbutton, ttk, LabelFrame, END, BOTH
 )
+from tkinter import font as tkfont
 
 from app_settings import get_setting, set_setting
 from ffmpeg_downloader import ensure_ffmpeg_available, get_ffmpeg_path
-from ffmpeg_helper import ConversionCancelled, ProcessHandle, get_audio_streams, convert_and_append_audio
+from ffmpeg_helper import (
+    ConversionCancelled, ProcessHandle, convert_and_append_audio, get_tracks, remove_streams_in_place,
+)
 from media_probe import find_ffprobe, parse_timecode
 from truehd_encoder import (
     LAYOUT_LABELS, STATUS_MISSING, STATUS_NO_71, STATUS_NOT_VERIFIED, STATUS_READY,
@@ -46,6 +49,8 @@ class ConverterApp:
         self.ffprobe_path = None
         self.current_file = None
         self.audio_streams = []
+        self.subtitle_streams = []
+        self.remove_ticks = set()       # absolute stream indices ticked for removal
         self.status_label = None
         self.log_widget = None
 
@@ -141,16 +146,18 @@ class ConverterApp:
             command=self._select_file
         ).pack(side="left")
 
-        # Audio streams display frame
-        audio_frame = LabelFrame(main_frame, text="Audio Streams", padx=10, pady=10)
-        audio_frame.pack(fill=BOTH, expand=True, pady=(0, 10))
-
-        scrollbar = Scrollbar(audio_frame)
-        scrollbar.pack(side="right", fill="y")
-
-        self.audio_text = Text(audio_frame, height=4, yscrollcommand=scrollbar.set)
-        self.audio_text.pack(fill=BOTH, expand=True)
-        scrollbar.config(command=self.audio_text.yview)
+        # Audio and subtitle tracks side by side (same height as the old
+        # audio list). Click a row to tick it for removal.
+        tracks = ttk.PanedWindow(main_frame, orient="horizontal")
+        tracks.pack(fill=BOTH, expand=True, pady=(0, 10))
+        audio_frame = LabelFrame(tracks, text="Audio Streams (click a row to tick ☑ for removal)",
+                                 padx=6, pady=2)
+        subs_frame = LabelFrame(tracks, text="Subtitle Tracks (click to tick ☑ for removal)",
+                                padx=6, pady=2)
+        tracks.add(audio_frame, weight=3)
+        tracks.add(subs_frame, weight=2)
+        self.audio_tree = self._make_track_tree(audio_frame)
+        self.subs_tree = self._make_track_tree(subs_frame)
 
         # Conversion settings frame
         output_frame = LabelFrame(main_frame, text="Conversion Settings", padx=10, pady=10)
@@ -240,6 +247,15 @@ class ConverterApp:
         )
         self.cancel_button.pack(side="left", padx=5)
 
+        self.remove_tracks_button = Button(
+            button_frame, text="Remove Ticked Tracks",
+            command=self._start_track_removal,
+            state="disabled"
+        )
+        self.remove_tracks_button.pack(side="left", padx=(20, 5))
+        self.ticked_label = Label(button_frame, text="", fg="#b36b00", anchor="w")
+        self.ticked_label.pack(side="left", padx=5, fill="x", expand=True)
+
         # Log viewer frame
         log_frame = LabelFrame(main_frame, text="Activity Log", padx=10, pady=10)
         log_frame.pack(fill=BOTH, expand=True, pady=(10, 0))
@@ -250,6 +266,68 @@ class ConverterApp:
         self.log_widget = Text(log_frame, height=6, state="disabled", yscrollcommand=log_scrollbar.set)
         self.log_widget.pack(fill=BOTH, expand=True)
         log_scrollbar.config(command=self.log_widget.yview)
+
+    def _make_track_tree(self, parent):
+        """Track list with a tick column; clicking a row toggles removal."""
+        scrollbar = Scrollbar(parent)
+        scrollbar.pack(side="right", fill="y")
+        # No heading row and compact rows, so the lists take no more height
+        # than the old 4-line audio text box.
+        style = ttk.Style()
+        line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        style.configure("Tracks.Treeview", rowheight=line + 2)
+        tree = ttk.Treeview(parent, columns=("remove", "num", "desc"), show="", style="Tracks.Treeview",
+                            height=4, selectmode="none", yscrollcommand=scrollbar.set)
+        tree.column("remove", width=28, minwidth=28, stretch=False, anchor="center")
+        tree.column("num", width=40, minwidth=40, stretch=False, anchor="w")
+        tree.column("desc", width=200, stretch=True, anchor="w")
+        tree.tag_configure("ticked", foreground="#b00020")
+        tree.pack(fill=BOTH, expand=True)
+        scrollbar.config(command=tree.yview)
+        tree.bind("<Button-1>", lambda e, t=tree: self._toggle_tick(t, e))
+        return tree
+
+    def _toggle_tick(self, tree, event):
+        row = tree.identify_row(event.y)
+        if not row or self.busy or not row.isdigit():
+            return "break"
+        index = int(row)
+        if index in self.remove_ticks:
+            self.remove_ticks.discard(index)
+        else:
+            self.remove_ticks.add(index)
+        self._render_track_row(tree, index)
+        self._refresh_convert_state()
+        return "break"
+
+    def _render_track_row(self, tree, index):
+        ticked = index in self.remove_ticks
+        tree.set(str(index), "remove", "☑" if ticked else "☐")
+        tree.item(str(index), tags=("ticked",) if ticked else ())
+
+    def _fill_track_trees(self):
+        for tree, items in ((self.audio_tree, self.audio_streams), (self.subs_tree, self.subtitle_streams)):
+            tree.delete(*tree.get_children())
+            for item in items:
+                text = str(item)
+                prefix = f"Stream #{item.stream_index}: "
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+                tree.insert("", END, iid=str(item.stream_index), values=("☐", f"#{item.stream_index}", text))
+                self._render_track_row(tree, item.stream_index)
+        if not self.subtitle_streams:
+            self.subs_tree.insert("", END, values=("", "", "No subtitle tracks"))
+
+    def _ticked(self):
+        """(audio, subtitle) streams currently ticked for removal."""
+        return ([s for s in self.audio_streams if s.stream_index in self.remove_ticks],
+                [s for s in self.subtitle_streams if s.stream_index in self.remove_ticks])
+
+    @staticmethod
+    def _describe_tracks(audio, subtitles):
+        return "\n".join([f"  • Audio #{s.stream_index}: {s}".replace(f"Stream #{s.stream_index}: ", "")
+                          for s in audio] +
+                         [f"  • Subtitle #{s.stream_index}: {s}" for s in subtitles])
 
     def _create_truehd_panel(self, parent):
         """TrueHD-only settings (shown when Dolby TrueHD is selected)."""
@@ -429,6 +507,19 @@ class ConverterApp:
         if ready and self._is_truehd():
             ready = not self._truehd_problems()
         self.convert_button.config(state="normal" if ready else "disabled")
+        audio, subtitles = self._ticked()
+        count = len(audio) + len(subtitles)
+        self.remove_tracks_button.config(state="normal" if count and not self.busy else "disabled")
+        if count:
+            parts = []
+            if audio:
+                parts.append(f"{len(audio)} audio")
+            if subtitles:
+                parts.append(f"{len(subtitles)} subtitle")
+            self.ticked_label.config(text=f"Ticked for removal: {' + '.join(parts)} "
+                                          "(also applied when converting)")
+        else:
+            self.ticked_label.config(text="")
 
     def _detect_audio(self):
         """Detect audio streams in the selected file."""
@@ -440,17 +531,17 @@ class ConverterApp:
             messagebox.showerror("Error", "FFmpeg not initialized")
             return
 
-        self.audio_text.config(state="normal")
-        self.audio_text.delete(1.0, END)
-        self._log("Detecting audio streams...")
+        self.audio_tree.delete(*self.audio_tree.get_children())
+        self.subs_tree.delete(*self.subs_tree.get_children())
+        self._log("Detecting audio and subtitle tracks...")
 
         def detect():
             try:
-                streams = get_audio_streams(self.current_file, self.ffmpeg_path, self.ffprobe_path)
+                streams, subtitles = get_tracks(self.current_file, self.ffmpeg_path, self.ffprobe_path)
 
                 # Update audio display
-                self.root.after(0, lambda: self._update_audio_display(streams))
-                self._log(f"Found {len(streams)} audio stream(s)")
+                self.root.after(0, lambda: self._update_audio_display(streams, subtitles))
+                self._log(f"Found {len(streams)} audio stream(s), {len(subtitles)} subtitle track(s)")
 
             except RuntimeError as e:
                 self.root.after(0, lambda: self._update_audio_display_error(str(e)))
@@ -459,33 +550,32 @@ class ConverterApp:
         thread = threading.Thread(target=detect, daemon=True)
         thread.start()
 
-    def _update_audio_display(self, streams):
-        """Update audio streams display on main thread."""
+    def _update_audio_display(self, streams, subtitles=()):
+        """Update audio/subtitle track lists on main thread."""
         self.audio_streams = streams
-        self.audio_text.config(state="normal")
-        self.audio_text.delete(1.0, END)
+        self.subtitle_streams = list(subtitles)
+        self.remove_ticks = set()
+        self._fill_track_trees()
         if streams:
-            for stream in streams:
-                self.audio_text.insert(END, f"{str(stream)}\n")
             self.track_combo.config(values=[str(stream) for stream in streams], state="readonly")
             # Pre-select the first DTS-HD MA track when one exists.
             preferred = next((i for i, s in enumerate(streams)
                               if s.format_name and s.format_name.startswith(("DTS-HD Master", "DTS:X"))), 0)
             self.track_combo.current(preferred)
         else:
-            self.audio_text.insert(END, "No audio streams found")
+            self.audio_tree.insert("", END, values=("", "", "No audio streams found"))
             self.track_combo.config(values=(), state="disabled")
             self.track_var.set("")
-        self.audio_text.config(state="disabled")
         self._refresh_truehd_compat()
 
     def _update_audio_display_error(self, error_msg):
         """Update audio display with error message on main thread."""
         self.audio_streams = []
-        self.audio_text.config(state="normal")
-        self.audio_text.delete(1.0, END)
-        self.audio_text.insert(END, f"Error: {error_msg}")
-        self.audio_text.config(state="disabled")
+        self.subtitle_streams = []
+        self.remove_ticks = set()
+        self._fill_track_trees()
+        self.subs_tree.delete(*self.subs_tree.get_children())
+        self.audio_tree.insert("", END, values=("", "", f"Error: {error_msg}"))
         self.track_combo.config(values=(), state="disabled")
         self.track_var.set("")
         self._refresh_truehd_compat()
@@ -675,12 +765,19 @@ class ConverterApp:
         codec_choice = self.codec_var.get()
         codec = "eac3" if "E-AC-3" in codec_choice else "ac3"
         source_stream = self.audio_streams[selected_track]
-        remove_source = self.remove_source_var.get()
+        ticked_audio, ticked_subs = self._ticked()
+        remove_source = self.remove_source_var.get() or source_stream in ticked_audio
+        other_audio = [s for s in ticked_audio if s is not source_stream]
+        remove_streams = [s.stream_index for s in other_audio + ticked_subs]
 
         action = "replace the selected original audio track" if remove_source else "keep the selected original audio track and append a converted copy"
+        extra = ""
+        if remove_streams:
+            extra = ("\n\nThese ticked tracks will also be removed:\n"
+                     + self._describe_tracks(other_audio, ticked_subs))
         if not messagebox.askyesno(
             "Update source MKV",
-            f"This will update the selected MKV in place. It will {action}.\n\n"
+            f"This will update the selected MKV in place. It will {action}.{extra}\n\n"
             "A temporary MKV is created first and replaces the source only after success. "
             "This cannot be undone. Continue?"
         ):
@@ -698,6 +795,8 @@ class ConverterApp:
         self._log(f"  Codec: {codec_choice}")
         self._log(f"  Bitrate: {bitrate}")
         self._log(f"  Remove original: {'Yes' if remove_source else 'No'}")
+        if remove_streams:
+            self._log("  Also removing tracks: " + ", ".join(f"#{i}" for i in remove_streams))
         self._log(f"  Status: Processing...")
         self._log(f"========================================")
 
@@ -713,6 +812,8 @@ class ConverterApp:
                     remove_source_stream=remove_source,
                     progress_callback=self._log,
                     handle=handle,
+                    remove_streams=remove_streams,
+                    removed_other_audio=len(other_audio),
                 )
 
                 if result:
@@ -736,6 +837,55 @@ class ConverterApp:
                 self._ui(self._set_busy, False)
 
         self.job_thread = threading.Thread(target=convert, daemon=True)
+        self.job_thread.start()
+
+    def _start_track_removal(self):
+        """Remove the ticked audio/subtitle tracks without converting anything."""
+        input_path = self.current_file
+        if not input_path or not os.path.exists(input_path):
+            messagebox.showwarning("Warning", "Please select an MKV file")
+            return
+        if not self.ffmpeg_path:
+            messagebox.showerror("Error", "FFmpeg not initialized")
+            return
+        audio, subtitles = self._ticked()
+        if not audio and not subtitles:
+            return
+        message = ("Remove these tracks from the MKV?\n\n" + self._describe_tracks(audio, subtitles)
+                   + "\n\nNothing is converted; every other track is copied unchanged. "
+                   "A temporary MKV is created first and replaces the source only after success. "
+                   "This cannot be undone.")
+        if len(audio) == len(self.audio_streams):
+            message += "\n\nWARNING: this removes ALL audio tracks - the film will have no sound."
+        if not messagebox.askyesno("Remove tracks", message, icon="warning"):
+            return
+
+        indices = [s.stream_index for s in audio + subtitles]
+        self.job_handle = ProcessHandle()
+        handle = self.job_handle
+        self._set_busy(True)
+        name = Path(input_path).name
+        self._log("========================================")
+        self._log(f"Removing tracks from {name}: " + ", ".join(f"#{i}" for i in indices))
+
+        def worker():
+            try:
+                remove_streams_in_place(input_path, self.ffmpeg_path, indices,
+                                        progress_callback=self._log, handle=handle)
+                self._log(f"✓ Removed {len(indices)} track(s)")
+                self._log("========================================")
+                self._ui(messagebox.showinfo, "Tracks removed",
+                         f"Removed {len(indices)} track(s).\n\nUpdated MKV:\n{input_path}")
+                self._ui(self._detect_audio)
+            except ConversionCancelled:
+                self._log("Track removal cancelled - the original MKV was not changed")
+            except RuntimeError as e:
+                self._log(f"Error: {e}")
+                self._ui(messagebox.showerror, "Track removal failed", str(e))
+            finally:
+                self._ui(self._set_busy, False)
+
+        self.job_thread = threading.Thread(target=worker, daemon=True)
         self.job_thread.start()
 
     def _start_truehd_conversion(self, input_path, stream):
@@ -762,6 +912,7 @@ class ConverterApp:
             clip_seconds=int(self.clip_length_var.get().split()[0]),
             clip_start=clip_start,
             replace_original=(self.output_mode_var.get() == "replace" and not test_clip),
+            remove_streams=tuple(sorted(self.remove_ticks)),
         )
 
         target = output_name(Path(input_path), options.clip_seconds if test_clip else None)
@@ -773,6 +924,10 @@ class ConverterApp:
                        "replace the original MKV with it.")
         else:
             summary = f"A new MKV will be created:\n{target.name}\n\nThe original MKV is not modified."
+        ticked_audio, ticked_subs = self._ticked()
+        if ticked_audio or ticked_subs:
+            summary += ("\n\nThese ticked tracks will not be included in the new MKV:\n"
+                        + self._describe_tracks(ticked_audio, ticked_subs))
         if not options.strict_verify:
             summary += "\n\nStrict lossless verification is OFF: the result will not be checked sample-by-sample."
         for warning in source_warnings(stream):

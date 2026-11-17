@@ -56,3 +56,41 @@ class AudioStreamInfo:
             f"Stream #{self.stream_index}: {self.format_name} - {self.channels}"
             f"{detail_str}{bitrate_str}{lang_str}{title_str}{flag_str}"
         )
+
+
+SUBTITLE_CODEC_NAMES = {
+    "hdmv_pgs_subtitle": "PGS",
+    "subrip": "SRT",
+    "ass": "ASS",
+    "ssa": "SSA",
+    "dvd_subtitle": "VobSub",
+    "dvb_subtitle": "DVB",
+    "webvtt": "WebVTT",
+    "mov_text": "MOV text",
+}
+
+
+@dataclass
+class SubtitleStreamInfo:
+    """A subtitle track (shown so it can be ticked for removal)."""
+    stream_index: int
+    codec_name: str
+    language: Optional[str] = None
+    title: Optional[str] = None
+    is_default: bool = False
+    is_forced: bool = False
+
+    @property
+    def format_label(self) -> str:
+        return SUBTITLE_CODEC_NAMES.get(self.codec_name.lower(), self.codec_name.upper())
+
+    def __str__(self) -> str:
+        parts = [self.format_label]
+        if self.language:
+            parts.append(f"[{self.language}]")
+        if self.title:
+            parts.append(f'"{self.title}"')
+        flags = [f for f, on in (("default", self.is_default), ("forced", self.is_forced)) if on]
+        if flags:
+            parts.append(f"{{{', '.join(flags)}}}")
+        return " ".join(parts)

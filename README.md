@@ -76,6 +76,18 @@ LibreMPEG build you provide - see [Dolby TrueHD](#dolby-truehd-lossless).
    default).
 5. Click **Convert**.
 
+### Removing audio and subtitle tracks
+
+Audio and subtitle tracks are listed side by side. Click a row to tick it
+(☑) for removal; click again to untick.
+
+- **Remove Ticked Tracks** removes them on their own - nothing is converted,
+  every other track is copied unchanged and the MKV is updated in place
+  after you confirm.
+- **Convert** also leaves the ticked tracks out (AC-3/E-AC-3 update the MKV;
+  TrueHD leaves them out of the new file and verifies they are gone and
+  everything else is intact).
+
 ## Dolby TrueHD (Lossless)
 
 Adds a Dolby TrueHD copy of a DTS-HD MA 5.1 or 7.1 track. This is useful when

@@ -194,6 +194,16 @@ class TrueHDWorkflowTests(Workdir):
         self.assertEqual([a["codec_name"] for a in audio], ["ac3", "truehd"])
         self.assertEqual([a["disposition"]["default"] for a in audio], [0, 1])
 
+    def test_remove_ticked_tracks_while_converting(self):
+        source = self.copy(self.fixture71)
+        result = self.convert(source, tw.TrueHDOptions(remove_streams=(2, 3)))
+        self.assertTrue(result.passed and result.lossless)
+        out = self.probe(result.final_path)
+        self.assertEqual([a["codec_name"] for a in media_probe.streams_of_type(out, "audio")],
+                         ["dts", "truehd"])
+        self.assertEqual(media_probe.streams_of_type(out, "subtitle"), [])
+        self.assertEqual(len(media_probe.streams_of_type(out, "attachment")), 1)
+
     def test_k_make_default_keeps_original(self):
         source = self.copy(self.fixture71)
         result = self.convert(source, tw.TrueHDOptions(make_default=True))
@@ -414,6 +424,33 @@ class ExistingWorkflowTests(Workdir):
         audio = media_probe.streams_of_type(out, "audio")
         self.assertEqual([a["codec_name"] for a in audio], ["ac3", "eac3"])
         self.assertEqual(len(media_probe.streams_of_type(out, "video")), 1)
+
+    def test_remove_tracks_only(self):
+        source = self.dir / "Movie.mkv"
+        shutil.copy2(self.fixture, source)
+        audio, subs = ffmpeg_helper.get_tracks(str(source), FFMPEG)
+        self.assertEqual(len(subs), 1)
+        self.assertTrue(ffmpeg_helper.remove_streams_in_place(
+            str(source), FFMPEG, [audio[1].stream_index, subs[0].stream_index]))
+        out = self.probe(source)
+        self.assertEqual([a["codec_name"] for a in media_probe.streams_of_type(out, "audio")], ["dts"])
+        self.assertEqual(media_probe.streams_of_type(out, "subtitle"), [])
+        self.assertEqual(len(media_probe.streams_of_type(out, "video")), 1)
+        self.assertEqual(len(media_probe.streams_of_type(out, "attachment")), 1)
+        self.assertEqual(len(out["chapters"]), 2)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["Movie.mkv"])
+
+    def test_convert_and_remove_subtitles(self):
+        source = self.dir / "Movie.mkv"
+        shutil.copy2(self.fixture, source)
+        audio, subs = ffmpeg_helper.get_tracks(str(source), FFMPEG)
+        self.assertTrue(ffmpeg_helper.convert_and_append_audio(
+            str(source), "640k", FFMPEG, audio[0].stream_index, len(audio), codec="ac3",
+            remove_streams=[audio[1].stream_index, subs[0].stream_index], removed_other_audio=1))
+        out = self.probe(source)
+        self.assertEqual([a["codec_name"] for a in media_probe.streams_of_type(out, "audio")],
+                         ["dts", "ac3"])
+        self.assertEqual(media_probe.streams_of_type(out, "subtitle"), [])
 
     def test_legacy_text_probe_still_works(self):
         source = self.dir / "Movie.mkv"

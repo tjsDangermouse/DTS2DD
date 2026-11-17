@@ -698,10 +698,20 @@ class TrueHDJob:
     language: Optional[str] = None
     remove_source: bool = False
     make_default: bool = False
+    remove_streams: Tuple[int, ...] = ()   # other ticked audio/subtitle tracks to drop
+    removed_other_audio: int = 0           # how many of remove_streams are audio
 
     @property
     def new_audio_index(self) -> int:
-        return self.audio_stream_count - (1 if self.remove_source else 0)
+        return self.audio_stream_count - (1 if self.remove_source else 0) - self.removed_other_audio
+
+    @property
+    def removed_indices(self) -> set:
+        """Absolute indices of every source stream left out of the output."""
+        removed = set(self.remove_streams)
+        if self.remove_source:
+            removed.add(self.source_stream_index)
+        return removed
 
     @property
     def title(self) -> str:
@@ -744,7 +754,7 @@ def build_truehd_command(encoder: str, job: TrueHDJob,
 
     k = job.new_audio_index
     cmd = [encoder, "-hide_banner", "-nostdin", "-i", job.source_path]
-    cmd += build_stream_maps(job.source_stream_index, job.remove_source)
+    cmd += build_stream_maps(job.source_stream_index, job.remove_source, job.remove_streams)
     cmd += [
         "-c", "copy",
         f"-c:a:{k}", "truehd",
