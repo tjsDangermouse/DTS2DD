@@ -14,7 +14,7 @@ from ffmpeg_helper import (
     ConversionCancelled, ProcessHandle, convert_and_append_audio, get_tracks, remove_streams_in_place,
 )
 from job_queue import (
-    CANCELLED, DONE, FAILED, KIND_LOSSY, KIND_REMOVE, KIND_REPAIR, KIND_TRUEHD, PARTIAL, SKIPPED,
+    CANCELLED, DONE, FAILED, KIND_LOSSY, KIND_M2TS, KIND_REMOVE, KIND_REPAIR, KIND_TRUEHD, PARTIAL, SKIPPED,
     JobResult, QueueJob, TrackNotFound, make_ref, ref_from_dict, ref_to_dict, resolve_ref,
 )
 from library_repair import (
@@ -24,7 +24,11 @@ from library_repair import (
 from library_scanner import LibraryScanner, ScanCache
 from media_inspector import ToolSet
 from media_probe import format_seconds
+from m2ts_remux import (
+    M2TSRemuxer, OutputExists, RemuxError, RemuxOptions, VerificationFailed, default_output_path, unique_output,
+)
 from truehd_encoder import EncoderReport, TrueHDError
+from tsmuxer_tool import TsMuxerError, TsMuxerInfo
 from truehd_workflow import TrueHDConverter, TrueHDOptions
 
 PREF_KEYS = ("keep_languages", "keep_forced", "keep_sdh", "remove_duplicate_subs")
@@ -112,6 +116,44 @@ def truehd_job(path: str, audio: Sequence, subtitles: Sequence, source, options:
     return QueueJob.for_file(KIND_TRUEHD, path, summary, description, params)
 
 
+def m2ts_output_for(path: str, output_dir: Optional[str]) -> str:
+    out = default_output_path(path)
+    return os.path.join(output_dir, os.path.basename(out)) if output_dir else out
+
+
+def m2ts_job(path: str, *, output: Optional[str] = None, output_dir: Optional[str] = None,
+             on_exists: str = "skip", subtitle_mode: str = "preferred", audio: Optional[Sequence] = None,
+             subtitles: Optional[Sequence] = None, all_audio: Sequence = (), all_subtitles: Sequence = (),
+             first_audio=None, full_verify: bool = True, accept_metadata_risk: bool = False,
+             config: Optional[ScannerConfig] = None, description: Optional[List[str]] = None) -> QueueJob:
+    """MKV -> M2TS remux (a new file next to the film or in ``output_dir``).
+
+    ``audio`` / ``subtitles`` (AudioStreamInfo / SubtitleStreamInfo) pin the
+    exact tracks chosen in the remux dialog; None = all compatible audio and
+    the subtitle policy ``subtitle_mode`` (preferred / none / all), worked
+    out when the job runs. ``on_exists``: skip / rename / overwrite (only
+    after the user confirmed replacing that file).
+    """
+    target = output or m2ts_output_for(path, output_dir)
+    summary = f"M2TS → {os.path.basename(target) if on_exists != 'rename' else os.path.basename(target) + ' (new name if taken)'}"
+    lines = description or [os.path.basename(path),
+                            "  • Remux to M2TS with tsMuxeR (video and audio copied, nothing re-encoded)",
+                            "  • Audio: " + ("as chosen" if audio is not None else "every compatible track"),
+                            "  • Subtitles: " + ("as chosen" if subtitles is not None else
+                                                 {"preferred": "compatible tracks in your kept languages",
+                                                  "none": "none", "all": "every PGS track"}[subtitle_mode])]
+    lines += [f"  • Output: {target}", f"  • If the output exists: {on_exists}",
+              f"  • Whole-stream audio comparison: {'yes' if full_verify else 'no'}",
+              "  • The MKV is never changed."]
+    params = {"output": output, "output_dir": output_dir, "on_exists": on_exists, "subtitle_mode": subtitle_mode,
+              "audio": _refs(audio, all_audio, all_subtitles) if audio is not None else None,
+              "subtitles": _refs(subtitles, all_audio, all_subtitles) if subtitles is not None else None,
+              "first_audio": ref_to_dict(make_ref(first_audio, all_audio)) if first_audio is not None else None,
+              "full_verify": full_verify, "accept_metadata_risk": accept_metadata_risk,
+              "prefs": {k: getattr(config, k) for k in PREF_KEYS} if config else {}}
+    return QueueJob.for_file(KIND_M2TS, path, summary, lines, params)
+
+
 # --------------------------------------------------------------------------
 # Running jobs
 # --------------------------------------------------------------------------
@@ -128,6 +170,7 @@ class QueueEnv:
     progress: Callable[[str, Optional[float], str], None] = lambda phase, fraction, detail: None
     handle: ProcessHandle = field(default_factory=ProcessHandle)
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    tsmuxer: Callable[[], Optional[TsMuxerInfo]] = lambda: None
 
     def new_handle(self) -> ProcessHandle:
         """Process handle for the next job; already cancelled if the queue was cancelled."""
@@ -298,10 +341,67 @@ def run_repair(job: QueueJob, env: QueueEnv) -> JobResult:
     return JobResult(_REPAIR_STATUS.get(outcome.status, SKIPPED), message, outcome.final_path)
 
 
+def run_m2ts(job: QueueJob, env: QueueEnv) -> JobResult:
+    early = _start(job, env)
+    if early:
+        return early
+    info = env.tsmuxer()
+    if info is None or not info.ok:
+        return JobResult(SKIPPED, (info.message if info else "tsMuxeR is not configured")
+                         + " (set it up in the M2TS remux window)")
+    if not env.ffprobe:
+        return JobResult(SKIPPED, "M2TS remuxing needs ffprobe for verification")
+    p = job.params
+    config = ScannerConfig(**{k: getattr(env.config, k) for k in ScannerConfig.__dataclass_fields__})
+    for key, value in (p.get("prefs") or {}).items():
+        setattr(config, key, value)
+    target = p.get("output") or m2ts_output_for(job.path, p.get("output_dir"))
+    on_exists = p.get("on_exists", "skip")
+    if os.path.exists(target):
+        if on_exists == "skip":
+            return JobResult(SKIPPED, f"{os.path.basename(target)} already exists")
+        if on_exists == "rename":
+            target = unique_output(target)
+    handle = env.new_handle()
+    remuxer = M2TSRemuxer(info, env.ffmpeg, env.ffprobe, env.tools, env.log, env.progress, handle)
+    try:
+        plan = remuxer.analyse(job.path, target, config, p.get("subtitle_mode", "preferred"))
+        if p.get("audio") is not None or p.get("subtitles") is not None or p.get("first_audio"):
+            refs = (p.get("audio") or []) + (p.get("subtitles") or [])
+            first = [p["first_audio"]] if p.get("first_audio") else []
+            _, _, indices = _resolve(job, env, refs + first)
+            chosen = set(indices[:len(refs)])
+            for t in plan.audio if p.get("audio") is not None else []:
+                t.selected = t.index in chosen
+            for t in plan.subtitles if p.get("subtitles") is not None else []:
+                t.selected = t.index in chosen
+            if first:
+                plan.first_audio = indices[-1]
+        if plan.metadata_warnings and not p.get("accept_metadata_risk"):
+            return JobResult(SKIPPED, "Dolby Vision / HDR10+ metadata may change in M2TS; queue it again and "
+                                      "confirm the compatibility-test warning")
+        result = remuxer.remux(plan, RemuxOptions(overwrite=on_exists == "overwrite",
+                                                  accept_metadata_risk=bool(p.get("accept_metadata_risk")),
+                                                  full_audio_compare=bool(p.get("full_verify", True))))
+    except ConversionCancelled:
+        return JobResult(CANCELLED, "cancelled - the MKV was not changed; the partial M2TS was deleted")
+    except TrackNotFound as e:
+        return JobResult(SKIPPED, str(e))
+    except OutputExists as e:
+        return JobResult(SKIPPED, str(e))
+    except VerificationFailed as e:
+        return JobResult(FAILED, f"{e}\n\n{e.report}")
+    except (RemuxError, TsMuxerError, RuntimeError, OSError) as e:
+        return JobResult(FAILED, str(e))
+    env.log(result.report)
+    return JobResult(DONE, "; ".join(result.outcomes) + "\n\n" + result.report, result.output)
+
+
 def make_executors(env: QueueEnv) -> Dict[str, Callable[[QueueJob], JobResult]]:
     return {
         KIND_REPAIR: lambda job: run_repair(job, env),
         KIND_LOSSY: lambda job: run_lossy(job, env),
         KIND_REMOVE: lambda job: run_remove(job, env),
         KIND_TRUEHD: lambda job: run_truehd(job, env),
+        KIND_M2TS: lambda job: run_m2ts(job, env),
     }

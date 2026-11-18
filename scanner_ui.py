@@ -172,6 +172,7 @@ class LibraryScannerTab:
             Button(buttons, text="Clean Subtitles…", command=lambda: self._open_repair([ACTION_CLEAN_SUBS])),
             Button(buttons, text="Convert FLAC to TrueHD…", command=lambda: self._open_repair([ACTION_FLAC_TRUEHD])),
             Button(buttons, text="Repair Selected…", command=lambda: self._open_repair(None)),
+            Button(buttons, text="Test M2TS Remux…", command=self._open_m2ts),
         ]
         for b in self.action_buttons:
             b.pack(side="left", padx=(0, 6))
@@ -566,6 +567,15 @@ class LibraryScannerTab:
             messagebox.showinfo("Repair", "Wait for the running repairs to finish.")
             return
         RepairDialog(self, items, preselect)
+
+    def _open_m2ts(self):
+        """MKV -> M2TS remux test (separate output; never changes the film)."""
+        from m2ts_ui import open_for_items
+        items = self._selected_items()
+        if not items:
+            messagebox.showinfo("Test M2TS Remux", "Select one or more films in the list first.")
+            return
+        open_for_items(self.app, items)
 
     def other_work_running(self) -> Optional[str]:
         """Why repairs cannot start now (they can always be queued)."""

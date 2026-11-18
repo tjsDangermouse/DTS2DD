@@ -236,6 +236,7 @@ class QueueTab:
         self.env = QueueEnv(
             ffmpeg=self.app.ffmpeg_path, ffprobe=tools.ffprobe, encoder=lambda: self.app.encoder_report,
             tools=tools, config=scanner.config, cache=scanner.cache, log=self.log,
+            tsmuxer=lambda: getattr(self.app, "tsmuxer_info", None),
             progress=lambda phase, fraction, detail: self._ui(self._progress, phase, fraction, detail))
         self.runner = QueueRunner(self.queue, make_executors(self.env), cancelled=self.env.cancel_event)
         self.running = True

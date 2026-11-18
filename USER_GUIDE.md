@@ -372,6 +372,75 @@ looks at the film again just before it runs. If an earlier job made a track
 impossible to identify, the later job is skipped and the report says why.
 The queue is kept when you close the app.
 
+## Remux to M2TS for the Panasonic UB450 (experimental)
+
+Use this when the Panasonic plays a film's AC-3 track but gives no sound from
+its Dolby TrueHD (Atmos) track. It makes an `.m2ts` copy of the film; the MKV
+is not changed. Nothing is re-encoded.
+
+### tsMuxeR
+
+The Windows installer includes tsMuxeR 2.7.0 - there is nothing to set up.
+The remux window's status line should say "tsMuxeR ready - …\tsmuxer\tsMuxeR.exe
+(bundled)". (Only when running from source or on macOS: get tsMuxeR from
+<https://github.com/justdan96/tsMuxer/releases> and choose it with **Browse…**.)
+
+### Remuxing one film
+
+1. **Convert File** tab: choose the MKV, then press **Remux to M2TS
+   (Panasonic)…**. (Or select the film in the **Library Scanner** and press
+   **Test M2TS Remux…**.)
+2. The window analyses the film (a few seconds to a minute) and shows:
+   the video and its Dolby Vision / HDR formats, every audio track with what
+   happens to it in the M2TS and its Atmos status, and the subtitles.
+3. Click a track to keep it (☑) or leave it out (☐). ✗ means M2TS cannot
+   carry it (e.g. FLAC, ASS subtitles) - it is listed in the report.
+   By default all compatible audio and the compatible subtitles in your kept
+   languages (normally English PGS) are kept.
+4. Choose the **First audio track**. M2TS has no "default" flag, so players
+   usually start with the first one. For the TrueHD test, put the TrueHD
+   track first.
+5. Check **Save as** (default: beside the film, `Film.m2ts`) and the estimated
+   size and free space.
+6. Press **Remux to M2TS**. For Dolby Vision / HDR10+ films you are asked to
+   confirm the compatibility test. If the M2TS already exists you are asked
+   before it is replaced.
+7. Progress is shown while tsMuxeR runs, then while the result is checked
+   (the whole-stream audio comparison reads both files once more; untick it
+   for a faster, sampled check - the audio is then not called "verified").
+8. The report opens at the end. Use **Save…** to keep it.
+
+**Add to Queue** queues the same remux instead. Selecting several films in the
+Library Scanner and pressing **Test M2TS Remux…** queues one remux per film.
+
+### Reading the report
+
+| Line | Meaning |
+|------|---------|
+| Remux completed | tsMuxeR finished and the M2TS was checked |
+| Audio streams verified | every kept track is present with the same channels, and TrueHD / AC-3 / E-AC-3 / DTS are byte-identical to the MKV |
+| Atmos metadata detected | the Atmos signalling was found again in the M2TS bitstream |
+| HDR metadata unchanged on the frames checked | Dolby Vision configuration, RPU, HDR10+ and HDR10 metadata match on the sample frames |
+| HDR metadata changed or unverified | something differs or could not be checked - the lines above it say what |
+| Panasonic playback not yet tested | always shown: only the player can tell |
+
+If a track is missing, the video frames differ, or audio bytes or Atmos
+signalling differ, the M2TS is deleted and the report says why.
+
+### Manual test on the Panasonic (Plex DLNA) and Denon
+
+1. Remux *Blade Runner 2049* (or another TrueHD Atmos film) with TrueHD as the
+   first audio track. Put the M2TS in a folder Plex serves over DLNA and let
+   Plex scan it.
+2. On the DP-UB450, open the Plex DLNA server and play the M2TS.
+3. On the Denon AVR-X1800H, check the input signal: it should show **Dolby
+   Atmos** / **Dolby TrueHD** (press INFO or check the front display).
+4. Switch to the AC-3 track on the player and check the Denon shows Dolby
+   Digital; switch back to TrueHD.
+5. Note the video: does the TV report Dolby Vision, HDR10+ or HDR10?
+6. Write down the result. Only when the Denon decodes TrueHD Atmos from the
+   M2TS has the workaround been confirmed for DLNA.
+
 ## Common Scenarios
 
 ### Scenario 1: Simple Conversion
