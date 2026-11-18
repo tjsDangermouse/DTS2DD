@@ -23,6 +23,7 @@ from version import __version__
 from scanner_ui import LibraryScannerTab
 from queue_ui import QueueTab
 from queue_jobs import convert_job, removal_job, truehd_job
+from job_queue import same_path
 from truehd_workflow import (
     TrueHDConverter, TrueHDOptions, find_stale_partials, output_name, source_warnings,
     truehd_target_layout, validate_source,
@@ -578,7 +579,7 @@ class ConverterApp:
 
     def job_finished(self, path: str):
         """A queued job changed ``path``: refresh this tab and the scanner row (main thread)."""
-        if self.current_file and os.path.abspath(self.current_file) == os.path.abspath(path) and not self.busy:
+        if self.current_file and same_path(self.current_file, path) and not self.busy:
             self._detect_audio()
         if self.scanner and path in self.scanner.items:
             tools = self.scanner._tools()

@@ -145,6 +145,11 @@ class QueueJob:
         return st.st_size == self.size and st.st_mtime_ns == self.mtime_ns
 
 
+def same_path(a: str, b: str) -> bool:
+    """True when two paths name the same file (Windows: case-insensitive, either slash)."""
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
 def default_queue_path() -> Path:
     return user_data_dir() / "job_queue.json"
 
@@ -254,9 +259,8 @@ class JobQueue:
             return [j for j in self.jobs if j.status == QUEUED]
 
     def jobs_for(self, path: str) -> List[QueueJob]:
-        path = os.path.abspath(path)
         with self._lock:
-            return [j for j in self.jobs if j.path == path and j.status in (QUEUED, RUNNING)]
+            return [j for j in self.jobs if same_path(j.path, path) and j.status in (QUEUED, RUNNING)]
 
     def next_pending(self) -> Optional[QueueJob]:
         with self._lock:

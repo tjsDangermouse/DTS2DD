@@ -91,6 +91,9 @@ class QueueModelTests(unittest.TestCase):
         q.add(job("A.mkv"))
         q.add(job("B.mkv"))
         self.assertEqual(len(q.jobs_for("/films/A.mkv")), 2)
+        self.assertEqual(len(q.jobs_for("/films/sub/../A.mkv")), 2)
+        if os.name == "nt":
+            self.assertEqual(len(q.jobs_for("\\FILMS\\a.MKV")), 2)      # Windows: case-insensitive
 
 
 class QueueRunnerTests(unittest.TestCase):
