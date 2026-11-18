@@ -44,8 +44,9 @@ KIND_REPAIR = "repair"      # Library Scanner repair (re-planned when it runs)
 KIND_LOSSY = "lossy"        # Convert File: AC-3 / E-AC-3
 KIND_TRUEHD = "truehd"      # Convert File: Dolby TrueHD
 KIND_REMOVE = "remove"      # Convert File: remove ticked tracks
+KIND_M2TS = "m2ts"          # MKV -> M2TS remux (new file; the MKV is never changed)
 KIND_LABELS = {KIND_REPAIR: "Library repair", KIND_LOSSY: "Convert", KIND_TRUEHD: "TrueHD",
-               KIND_REMOVE: "Remove tracks"}
+               KIND_REMOVE: "Remove tracks", KIND_M2TS: "M2TS remux"}
 
 
 # --------------------------------------------------------------------------

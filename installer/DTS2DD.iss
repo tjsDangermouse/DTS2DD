@@ -6,6 +6,7 @@
 ;   dist\DTS2DD\DTS to AC-3 Converter.exe, _internal\...   (PyInstaller)
 ;   dist\DTS2DD\ffmpeg\ffmpeg.exe, ffprobe.exe              (standard FFmpeg)
 ;   dist\DTS2DD\librempeg\ffmpeg.exe, ffprobe.exe           (LibreMPEG, TrueHD)
+;   dist\DTS2DD\tsmuxer\tsMuxeR.exe                         (tsMuxeR, M2TS remux)
 ;   dist\DTS2DD\licenses\...                                (third-party licences)
 ;
 ; Compile:  iscc /DAppVersion=1.1.0 installer\DTS2DD.iss

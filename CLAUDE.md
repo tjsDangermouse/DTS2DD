@@ -53,6 +53,11 @@ DTS to AC-3/DD+ Converter: A cross-platform GUI application that converts DTS au
 - `queue_jobs.py`: job builders (`convert_job`, `removal_job`, `truehd_job` from the Convert tab; `repair_job` from the scanner - stores the requested actions/options and RE-PLANS at run time) and executors calling the existing workflows. `QueueEnv.new_handle()` pre-cancels if the queue was cancelled between jobs
 - `queue_ui.py`: tab; `ConverterApp.set_external_busy()` derives busy from scanner repairs + queue; `job_finished()` refreshes the Convert tab and scanner row
 
+**M2TS remux** (experimental Panasonic DLNA test; new file, the MKV is only read)
+- `tsmuxer_tool.py`: bundled in the Windows installer (`tsmuxer/tsMuxeR.exe`, official 2.7.0 win64, SHA-256 pinned in the workflow; CI runs `RealTsMuxerTests` with it). `check_tsmuxer()` (setting `tsmuxer_path` -> `tsmuxer/` beside app -> user data dir -> PATH / Program Files; banner `tsMuxeR version X`, min 2.6.16), `parse_detection()` of `tsMuxeR <file>` output, `build_meta()` (UTF-8 `.meta`, `MUXOPT --new-audio-pes --vbr --vbv-len=500`, quoted paths, `track=` = MKV position 1-based = ffprobe index + 1, `lang=` only 3 letters), `run_tsmuxer()` parses `n% complete`, success `Mux successful complete`; M2TS mode is chosen by the `.m2ts` extension
+- `m2ts_remux.py`: `M2TSRemuxer.analyse()` (inspect_file + tsMuxeR detection + frame HDR snapshot) -> `build_plan()` (compatibility per track, blockers, metadata warnings needing confirmation) -> `remux()` (checks, hidden `.<stem>.remuxing-*.m2ts` temp in the output folder, `verify_output()`, `os.replace`; failures delete the temp) -> `format_report()`
+- `m2ts_ui.py`: `M2TSDialog` (one film), `M2TSBatchDialog` (scanner selection -> queue jobs); queue kind `m2ts` (`queue_jobs.m2ts_job/run_m2ts`, re-planned at run time); scanner rule `ub450.truehd_mkv` -> action `m2ts_remux` (not a repair; `RepairDialog` ignores it)
+
 **app_paths.py** - `app_dir()` (exe folder when frozen), `user_data_dir()` (%LOCALAPPDATA%\DTS2DD), `ffmpeg_folders()`: bundled `ffmpeg/` beside the exe -> (PATH, checked in ffmpeg_downloader) -> per-user download folder -> legacy `./ffmpeg`. Never write into the program folder.
 
 **app_settings.py** - JSON settings in %APPDATA%/DTS2DD (or `DTS2DD_SETTINGS_DIR`); stores `truehd_encoder_path`
@@ -97,9 +102,18 @@ Main thread uses `root.after()` to safely update GUI from worker threads. Never 
 - Worst case (incompressible full-scale noise, measured): max AU 1248 B for 7.1/48k, 934 B for 5.1/48k, 1648 B for 5.1/96k - always under the 1875 B limit at 18 Mb/s. 7.1/96k (2192 B) and 5.1/192k (3094 B) CAN exceed; the AU-size check then fails the conversion. LibreMPEG output is ~30% larger than raw PCM on noise (Dolby's encoder is far more efficient).
 - zlib: LibreMPEG built with `--disable-autodetect` lacks zlib and copies zlib-compressed MKV tracks (PGS subtitles) still compressed = corrupted. CI builds with `--enable-zlib`; `check_encoder` refuses builds without zlib or the peak option; `_check_copied_packets` compares every copied track (first 5 min / whole clip) against the original, both read by the standard FFmpeg.
 
+### M2TS / tsMuxeR findings (from the tsMuxer 2.7.0 source, Nov 2026; the real binary runs only in Windows CI)
+
+- tsMuxer is archived; 2.7.0 (Apr 2025) is the final official release. tsmuxer.net "2.20" is a third-party site - not used.
+- MKV TrueHD without an AC-3 core is detected as `A_MLP` and copied as stream type 0x83 (registration "mlpa"); info says `TRUE-HD + ATMOS` when 4 substreams. tsMuxeR never creates a core (with `A_AC3` + TrueHD it keeps an existing one). Blu-ray players may require the core - that is what the Panasonic test shows.
+- FFmpeg reads every 0x83 PID as truehd PLUS an AC-3 sub-stream with the same `id` (0 channels when there is no core). `_output_groups()` sets those apart.
+- HEVC: in non-Blu-ray mode tsMuxeR writes a DOVI descriptor when RPU NALs are found, deriving profile/compat from the SPS (PQ single layer -> 8.1, HLG -> 8.4) and the level from size/fps; RPU, HDR10+ and HDR10 SEI stay in-band. MKV-header-only mastering metadata is lost in M2TS.
+- Raw elementary streams (`-c copy -f truehd/ac3/eac3/dts`) were byte-identical MKV vs FFmpeg-made M2TS; decoded video frames identical only with `-noautorotate`. FFmpeg's mpegts muxer writes no DOVI descriptor (the test stand-in shows "Dolby Vision configuration -> none").
+- SRT is rendered to PGS by tsMuxeR (needs font/video-width/height); ASS/SSA, VobSub, FLAC, Opus, Vorbis unsupported.
+
 ### Tests
 
-`python tests/fetch_samples.py` then `DTS2DD_LIBREMPEG=... python -m pytest tests`. Unit tests (`tests/test_unit.py`) need nothing; integration tests skip without tools/samples. Hardware (Plex/Fire TV/AVR) testing is manual - USER_GUIDE.md.
+`python tests/fetch_samples.py` then `DTS2DD_LIBREMPEG=... python -m pytest tests`. M2TS: `tests/fake_tsmuxer.py` stands in for tsMuxeR (FFmpeg mux); `DTS2DD_TSMUXER=...` runs the real-tsMuxeR test. Unit tests (`tests/test_unit.py`) need nothing; integration tests skip without tools/samples. Hardware (Plex/Fire TV/AVR) testing is manual - USER_GUIDE.md.
 
 ## Building for Distribution
 
@@ -216,6 +230,9 @@ library_repair.py         # Repair plans, validation, batches
 job_queue.py              # Persistent queue + runner + track references
 queue_jobs.py             # Queue job builders / executors
 queue_ui.py               # Queue tab
+tsmuxer_tool.py           # tsMuxeR discovery, detection, meta file, runner
+m2ts_remux.py             # MKV -> M2TS plan, remux, verification, report
+m2ts_ui.py                # M2TS remux / batch windows
 version.py                # App version (window title, installer, release tag)
 installer/                # Inno Setup script + third-party notices
 .github/workflows/        # Windows installer build + tests

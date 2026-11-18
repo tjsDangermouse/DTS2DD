@@ -44,12 +44,16 @@ ACTION_CLEAN_SUBS = "clean_subtitles"
 ACTION_FLAC_TRUEHD = "flac_to_truehd"
 ACTION_DTS_CONVERT = "dts_convert"
 ACTION_FIX_DEFAULT = "fix_default_audio"
+ACTION_M2TS = "m2ts_remux"          # separate output file (m2ts_remux / m2ts_ui), not an in-place repair
 ACTION_LABELS = {
     ACTION_CLEAN_SUBS: "Clean subtitles",
     ACTION_FLAC_TRUEHD: "FLAC → TrueHD",
     ACTION_DTS_CONVERT: "Convert DTS",
     ACTION_FIX_DEFAULT: "Fix default audio",
+    ACTION_M2TS: "Test M2TS Remux",
 }
+UB450_TRUEHD_MESSAGE = ("Potentially unsupported Dolby TrueHD audio over DLNA. M2TS remuxing may improve "
+                        "compatibility, but is not guaranteed.")
 
 
 @dataclass
@@ -797,6 +801,33 @@ def _ub450_audio(report, config):
                           f"Audio #{a.index}: {a.codec.title()} may be unsupported",
                           "Blu-ray player media engines usually do not decode this codec; the film may play "
                           "without sound.", evidence=_audio_evidence(a), stream_index=a.index)
+
+
+@rule("ub450.truehd_mkv", CAT_ATMOS, "Dolby TrueHD in MKV over DLNA (M2TS remux test)", device="ub450_dlna")
+def _ub450_truehd(report, config):
+    """The UB450 played the AC-3 fallback but gave no sound from TrueHD Atmos in MKV over DLNA.
+
+    E-AC-3 JOC plays on this player, so it is deliberately not flagged.
+    """
+    if not report.is_mkv:
+        return
+    for a in report.audio:
+        if a.codec != "truehd":
+            continue
+        atmos = bool(a.atmos and a.atmos.atmos)
+        detail = UB450_TRUEHD_MESSAGE
+        video = next((v for v in report.video if not v.attached_pic), None)
+        if video is not None and (video.dv_profile is not None or "HDR10+" in video.hdr_formats):
+            kinds = " and ".join(k for k, on in (("Dolby Vision", video.dv_profile is not None),
+                                                ("HDR10+", "HDR10+" in video.hdr_formats)) if on)
+            detail += (f" This film has {kinds}: M2TS remuxing may not preserve all of that video metadata; "
+                       "the remux test checks and reports it.")
+        fallback = [o for o in report.audio if o.codec in ("ac3", "eac3")]
+        evidence = _audio_evidence(a) + ([f"Atmos: {a.atmos.status}"] if a.atmos else [])
+        evidence.append("fallback track(s): " + (", ".join(_track_name(o) for o in fallback) or "none"))
+        yield Finding("ub450.truehd_mkv", WARNING, CAT_ATMOS,
+                      f"Audio #{a.index}: TrueHD{' Atmos' if atmos else ''} in MKV - possibly no sound over DLNA",
+                      detail, evidence=evidence, stream_index=a.index, actions=[ACTION_M2TS])
 
 
 # ---- metadata ---------------------------------------------------------------

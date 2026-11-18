@@ -8,6 +8,7 @@ REM you provide the tools yourself:
 REM
 REM   vendor\ffmpeg\ffmpeg.exe, ffprobe.exe, LICENSE     (gyan.dev essentials build)
 REM   vendor\librempeg\ffmpeg.exe, ffprobe.exe, COPYING.AGPLv3, LICENSE.md
+REM   vendor\tsmuxer\tsMuxeR.exe                         (tsMuxer 2.7.0 win64, github.com/justdan96/tsMuxer)
 REM
 REM and Inno Setup 6.3+ (https://jrsoftware.org/isinfo.php) for the installer.
 
@@ -60,6 +61,13 @@ if exist "vendor\ffmpeg\ffmpeg.exe" (
     if exist "vendor\ffmpeg\LICENSE" copy /y "vendor\ffmpeg\LICENSE" "dist\DTS2DD\licenses\FFmpeg-LICENSE.txt" >nul
 ) else (
     echo    WARNING: vendor\ffmpeg\ffmpeg.exe not found - the app will download FFmpeg on first run.
+)
+if exist "vendor\tsmuxer\tsMuxeR.exe" (
+    mkdir "dist\DTS2DD\tsmuxer"
+    copy /y "vendor\tsmuxer\tsMuxeR.exe" "dist\DTS2DD\tsmuxer\" >nul
+    copy /y "installer\tsMuxer-LICENSE.txt" "dist\DTS2DD\licenses\" >nul
+) else (
+    echo    WARNING: vendor\tsmuxer\tsMuxeR.exe not found - M2TS remuxing will not be available.
 )
 if exist "vendor\librempeg\ffmpeg.exe" (
     mkdir "dist\DTS2DD\librempeg"

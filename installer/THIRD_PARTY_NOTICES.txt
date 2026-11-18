@@ -1,7 +1,7 @@
 DTS to AC-3 Converter - third-party software
 ============================================
 
-This installation includes two separate programs that the converter runs as
+This installation includes three separate programs that the converter runs as
 external processes. They are not linked into the converter.
 
 1. FFmpeg (folder: ffmpeg\)
@@ -20,6 +20,13 @@ external processes. They are not linked into the converter.
    Corresponding source code: the commit above. The exact build commands are
    in .github/workflows/windows-installer.yml of
    https://github.com/tjsDangermouse/DTS2DD
+
+3. tsMuxeR (folder: tsmuxer\)
+   Used only for the experimental MKV to M2TS remux.
+   Build: official tsMuxer 2.7.0 Windows x64 release (see tsMuxer-SOURCE.txt),
+   unmodified.
+   Licence: Apache License 2.0 (see tsMuxer-LICENSE.txt).
+   Source code: https://github.com/justdan96/tsMuxer (tag 2.7.0)
 
 Dolby, Dolby TrueHD and Dolby Atmos are trademarks of Dolby Laboratories.
 DTS and DTS-HD are trademarks of DTS, Inc. This software is not certified by

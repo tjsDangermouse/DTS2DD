@@ -21,6 +21,7 @@ from truehd_encoder import (
 )
 from version import __version__
 from scanner_ui import LibraryScannerTab
+from m2ts_ui import M2TSDialog, check_tsmuxer_async
 from queue_ui import QueueTab
 from queue_jobs import convert_job, removal_job, truehd_job
 from job_queue import same_path
@@ -66,6 +67,8 @@ class ConverterApp:
         self.job_thread = None
         self.scanner = None
         self.queue_tab = None
+        self.tsmuxer_info = None        # tsmuxer_tool.TsMuxerInfo once checked
+        self.m2ts_dialogs = set()       # open M2TS remux windows
 
         self._create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -89,6 +92,7 @@ class ConverterApp:
                     self._log("Note: ffprobe not found - using basic audio detection")
                 self.root.after(2000, lambda: self._update_status(""))
                 self._ui(self._check_truehd_encoder)
+                self._ui(check_tsmuxer_async, self)
 
             except RuntimeError as e:
                 self._ui(self._show_error, str(e))
@@ -160,6 +164,11 @@ class ConverterApp:
             file_frame, text="Browse",
             command=self._select_file
         ).pack(side="left")
+        Button(
+            file_frame, text="Remux to M2TS (Panasonic)…",
+            command=self._open_m2ts
+        ).pack(side="left", padx=(12, 0))
+        Label(file_frame, text="experimental - new file, MKV unchanged", fg="#555555").pack(side="left", padx=4)
 
         # Audio and subtitle tracks side by side (same height as the old
         # audio list). Click a row to tick it for removal.
@@ -816,7 +825,25 @@ class ConverterApp:
             self._log("Cancelling...")
             threading.Thread(target=self.job_handle.cancel, daemon=True).start()
 
+    def _open_m2ts(self):
+        path = self.file_entry.get().strip() or self.current_file
+        if not path or not os.path.isfile(path):
+            messagebox.showwarning("Remux to M2TS", "Select an MKV file first")
+            return
+        if not self.ffmpeg_path:
+            messagebox.showerror("Remux to M2TS", "FFmpeg is still being set up. Try again in a moment.")
+            return
+        M2TSDialog(self, path)
+
     def _on_close(self):
+        running = [d for d in self.m2ts_dialogs if d.running]
+        if running:
+            if not messagebox.askyesno("M2TS remux running",
+                                       "An M2TS remux is running. Stop it and quit?\n\n"
+                                       "The MKV is not changed; the partial M2TS is deleted."):
+                return
+            for d in running:
+                d.shutdown()
         if self.queue_tab and self.queue_tab.running:
             if not messagebox.askyesno("Queue running",
                                        "The queue is running. Stop it and quit?\n\n"
@@ -1188,15 +1215,18 @@ class ConverterApp:
 def run_self_test(report_path: str) -> int:
     """Headless check used by the Windows build after installing.
 
-    Writes a JSON report and returns 0 only when the bundled FFmpeg is found
-    and the TrueHD encoder passes its self-test. Never downloads anything.
+    Writes a JSON report and returns 0 only when the bundled FFmpeg is found,
+    the TrueHD encoder passes its self-test and tsMuxeR runs. Never downloads anything.
     """
     import json
     from dataclasses import asdict
     from app_paths import app_dir
 
+    from tsmuxer_tool import check_tsmuxer
+
     ffmpeg = get_ffmpeg_path()
     report = check_encoder(get_setting("truehd_encoder_path"), reference_decoder=ffmpeg)
+    tsmuxer = check_tsmuxer(get_setting("tsmuxer_path"))
     data = {
         "version": __version__,
         "app_dir": str(app_dir()),
@@ -1207,10 +1237,14 @@ def run_self_test(report_path: str) -> int:
         "status": report.status,
         "message": report.message,
         "tests": [asdict(t) for t in report.tests],
+        "tsmuxer": tsmuxer.path,
+        "tsmuxer_origin": tsmuxer.origin,
+        "tsmuxer_status": tsmuxer.status,
+        "tsmuxer_message": tsmuxer.message,
     }
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    ok = bool(ffmpeg and data["ffprobe"]) and report.status == STATUS_READY
+    ok = bool(ffmpeg and data["ffprobe"]) and report.status == STATUS_READY and tsmuxer.ok
     return 0 if ok else 1
 
 

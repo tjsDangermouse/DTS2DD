@@ -23,6 +23,10 @@ env:
   FFMPEG_VERSION: 9.0.2
   FFMPEG_URL: https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip
   FFMPEG_SHA256: 60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
+  # tsMuxeR (M2TS remux): final official release of justdan96/tsMuxer, Apache-2.0
+  TSMUXER_VERSION: 2.7.0
+  TSMUXER_URL: https://github.com/justdan96/tsMuxer/releases/download/2.7.0/tsMuxer-2.7.0-win64.zip
+  TSMUXER_SHA256: e3cf117d2c6f01332188123641c63fe38ab9731ae7aa23645f6f9a261a7a301c
   PYTHONUTF8: "1"
 
 jobs:
@@ -137,6 +141,17 @@ jobs:
           Copy-Item "$($root.FullName)\bin\ffmpeg.exe", "$($root.FullName)\bin\ffprobe.exe", "$($root.FullName)\LICENSE" vendor/ffmpeg/
           "$env:FFMPEG_VERSION $env:FFMPEG_URL" | Out-File vendor/ffmpeg/SOURCE.txt -Encoding utf8
 
+      # ------------------------------------------------------------------ tsMuxeR
+      - name: Download tsMuxeR (checksum verified)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest $env:TSMUXER_URL -OutFile tsmuxer.zip
+          $actual = (Get-FileHash tsmuxer.zip -Algorithm SHA256).Hash
+          if ($actual -ne $env:TSMUXER_SHA256) { throw "tsMuxeR SHA-256 mismatch: $actual" }
+          Expand-Archive tsmuxer.zip -DestinationPath vendor/tsmuxer
+          if (-not (Test-Path vendor/tsmuxer/tsMuxeR.exe)) { throw "tsMuxeR.exe missing from the zip" }
+          "$env:TSMUXER_VERSION $env:TSMUXER_URL" | Out-File vendor/tsmuxer/SOURCE.txt -Encoding utf8
+
       # ------------------------------------------------------------------- Python
       - uses: actions/setup-python@v5
         with:
@@ -154,10 +169,11 @@ jobs:
         run: |
           $env:DTS2DD_LIBREMPEG = (Resolve-Path vendor/librempeg/ffmpeg.exe).Path
           $env:DTS2DD_FFMPEG = (Resolve-Path vendor/ffmpeg/ffmpeg.exe).Path
+          $env:DTS2DD_TSMUXER = (Resolve-Path vendor/tsmuxer/tsMuxeR.exe).Path
           python tests/fetch_samples.py
           python -m pytest tests -v -rs --junitxml=test-results.xml
-          # Integration tests must have run, not been skipped
-          if (Select-String -Path test-results.xml -Pattern 'message="(LibreMPEG / FFmpeg|FATE samples)' -Quiet) {
+          # Integration tests must have run, not been skipped (incl. the real tsMuxeR remux)
+          if (Select-String -Path test-results.xml -Pattern 'message="(LibreMPEG / FFmpeg|FATE samples|set DTS2DD_TSMUXER)' -Quiet) {
             throw "Integration tests were skipped" }
 
       # ---------------------------------------------------------------- Package
@@ -166,11 +182,14 @@ jobs:
           python create_icon.py
           python -m PyInstaller --noconfirm --clean converter.spec
 
-      - name: Add FFmpeg, LibreMPEG and licences to the app folder
+      - name: Add FFmpeg, LibreMPEG, tsMuxeR and licences to the app folder
         shell: pwsh
         run: |
           $app = "dist/DTS2DD"
-          New-Item -ItemType Directory -Force "$app/ffmpeg", "$app/librempeg", "$app/licenses" | Out-Null
+          New-Item -ItemType Directory -Force "$app/ffmpeg", "$app/librempeg", "$app/tsmuxer", "$app/licenses" | Out-Null
+          Copy-Item vendor/tsmuxer/tsMuxeR.exe "$app/tsmuxer/"
+          Copy-Item installer/tsMuxer-LICENSE.txt "$app/licenses/tsMuxer-LICENSE.txt"
+          Copy-Item vendor/tsmuxer/SOURCE.txt "$app/licenses/tsMuxer-SOURCE.txt"
           Copy-Item vendor/ffmpeg/ffmpeg.exe, vendor/ffmpeg/ffprobe.exe "$app/ffmpeg/"
           Copy-Item vendor/librempeg/ffmpeg.exe, vendor/librempeg/ffprobe.exe "$app/librempeg/"
           Copy-Item vendor/ffmpeg/LICENSE "$app/licenses/FFmpeg-LICENSE.txt"
@@ -216,6 +235,7 @@ jobs:
           $report = Get-Content selftest-installed.json | ConvertFrom-Json
           if ($report.encoder_origin -ne "bundled") { throw "Installed app did not use its bundled LibreMPEG" }
           if ($report.ffmpeg -notlike "$env:LOCALAPPDATA\Programs\DTS2DD\*") { throw "Installed app did not use its bundled FFmpeg: $($report.ffmpeg)" }
+          if ($report.tsmuxer_origin -ne "bundled") { throw "Installed app did not use its bundled tsMuxeR: $($report.tsmuxer)" }
 
       - name: Uninstall silently
         shell: pwsh

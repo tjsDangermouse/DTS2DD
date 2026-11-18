@@ -29,13 +29,16 @@ selected files with the same safe workflows.
 - **Progress and control**: percentage, speed and time remaining for TrueHD
   conversions, a Cancel button, and an activity log with the real FFmpeg
   error when something fails.
-- **Self-contained Windows installer**: FFmpeg and the TrueHD encoder are
-  included, so there is nothing else to install or configure.
+- **Self-contained Windows installer**: FFmpeg, the TrueHD encoder and
+  tsMuxeR are included, so there is nothing else to install or configure.
 - **Library Scanner**: recursive, read-only analysis of MKV (and MP4)
   libraries with device profiles for Fire TV / Plex, Panasonic UB450 DLNA and
   LG C5 Plex, plus individual or batch repairs (see below).
 - **Job queue**: queue different changes for different films from either tab
   and run them one after another (see "Queue" below).
+- **MKV to M2TS remux (experimental)**: a container-only remux with tsMuxeR for
+  Panasonic players that give no sound from TrueHD in MKV over DLNA. A new
+  `.m2ts` is written beside the film; the MKV is never changed (see below).
 
 ## Installation
 
@@ -263,6 +266,55 @@ was running when the app closed is shown as Interrupted (its film is
 unchanged) and can be retried. While the queue runs, the Convert button and
 direct repairs are disabled so two jobs never write at the same time.
 
+## MKV to M2TS remux (Panasonic compatibility, experimental)
+
+A Panasonic DP-UB450 playing MKVs from Plex over DLNA plays DTS-HD MA,
+E-AC-3 JOC and AC-3, but gives no sound from Dolby TrueHD (Atmos). A
+reported workaround for similar Panasonic players (over USB) is to remux the
+film to M2TS with tsMuxeR. **Remux to M2TS (Panasonic)…** (Convert File tab)
+and **Test M2TS Remux…** (Library Scanner) create that M2TS so you can test it.
+Whether it helps over DLNA is not known until you try it on the player.
+
+- **Container change only.** Video, audio and PGS subtitles are copied by
+  tsMuxeR; nothing is re-encoded, no AC-3 core is created, TrueHD is never
+  converted. A new `Film.m2ts` is written (hidden temporary file first,
+  renamed after verification); the MKV is only read. An existing M2TS is
+  replaced only after you confirm.
+- **tsMuxeR is included in the Windows installer** (the official tsMuxer
+  2.7.0 x64 build, the final release, Apache-2.0; pinned by SHA-256 in the
+  build). Nothing to install. When running from source or on macOS, put
+  tsMuxeR (2.6.16 or later) in a `tsmuxer` folder beside the app, on PATH, or
+  choose it with **Browse…**; **Get tsMuxeR…** then opens the official
+  release page (the app never downloads it).
+- **What can be kept**: HEVC/AVC/VC-1/MPEG-2 video; TrueHD (incl. Atmos),
+  AC-3, E-AC-3 (incl. JOC), DTS / DTS-HD MA / DTS:X, AAC, PCM (as Blu-ray
+  LPCM); PGS subtitles. SRT can be rendered to PGS by tsMuxeR (off by
+  default). FLAC, Opus, Vorbis, ASS/SSA and VobSub are left out and listed.
+  M2TS has no chapters, attachments, track names or default flags, so you
+  choose which audio track comes first.
+- **TrueHD**: MKV TrueHD tracks normally have no embedded AC-3 core (Blu-ray
+  discs interleave one). tsMuxeR copies the stream as-is (M2TS stream type
+  0x83); the separate AC-3 track stays its own stream. Whether the player
+  accepts TrueHD without a core is part of what the test shows.
+- **Dolby Vision / HDR10+**: tsMuxeR copies the RPU and HDR10+ data in the
+  video stream and writes its own Dolby Vision descriptor (profile derived
+  from the stream). Films with Dolby Vision or HDR10+ need an explicit
+  "compatibility test" confirmation, and the result is compared.
+- **Verification** (standard FFmpeg/ffprobe): every chosen track present
+  with the same codec and channels; decoded video frames identical at the
+  start and middle; TrueHD / AC-3 / E-AC-3 / DTS bitstreams byte-identical
+  (whole TrueHD and DTS-HD streams by default); Atmos re-detected from the
+  M2TS bitstream; Dolby Vision configuration and frame metadata (RPU, HDR10+,
+  mastering display, MaxCLL) before vs after. A file that fails is deleted.
+  The report lists: *Remux completed*, *Audio streams verified* (or not),
+  *Atmos metadata detected* (or NOT detected), *HDR metadata unchanged* or
+  *changed or unverified*, and always *Panasonic playback not yet tested*.
+- **Batch**: select several films in the Library Scanner; they are added to
+  the Queue (subtitle policy, output folder, skip / rename existing). The
+  Panasonic UB450 profile flags TrueHD in MKV with "Potentially unsupported
+  Dolby TrueHD audio over DLNA…" and recommends **Test M2TS Remux**; E-AC-3
+  JOC is not flagged (it plays on the UB450).
+
 ### How Atmos is identified
 
 - **E-AC-3**: a few seconds from the start and the middle of the track are
@@ -380,6 +432,13 @@ synthetic bitstreams) and `tests/test_scanner_integration.py` (FFmpeg-made
 MKVs; FLAC -> TrueHD needs LibreMPEG, the Dolby Vision test needs the FATE
 sample). The "JOC" fixtures signal JOC but contain no Atmos audio.
 
+M2TS remux tests: `tests/test_m2ts_unit.py` (mocked tsMuxeR output and
+probes, synthetic TrueHD Atmos headers) and `tests/test_m2ts_integration.py`
+(real files through `tests/fake_tsmuxer.py`, a stand-in that prints
+tsMuxeR's output but muxes with FFmpeg). Set `DTS2DD_TSMUXER` to a real
+tsMuxeR to run `RealTsMuxerTests`. None of these prove that tsMuxeR keeps
+Dolby Vision or Atmos on a real film - use the remux report and the player.
+
 Unit tests need nothing else. Integration tests skip unless LibreMPEG,
 FFmpeg, ffprobe and the samples are available. The Windows installer is built
 and tested on Windows by GitHub Actions on every push
@@ -406,6 +465,9 @@ DTS2DD/
 ├── job_queue.py              # Persistent job queue, track references, sequential runner
 ├── queue_jobs.py             # Queue jobs from both tabs and their executors
 ├── queue_ui.py               # Queue tab
+├── tsmuxer_tool.py           # tsMuxeR discovery, version check, track detection, meta file, runner
+├── m2ts_remux.py             # MKV -> M2TS planning, remux, verification, report
+├── m2ts_ui.py                # M2TS remux window (one film) and batch window (scanner)
 ├── audio_stream_info.py      # Audio stream data model
 ├── app_paths.py              # Program and per-user folders
 ├── app_settings.py           # Persistent settings
