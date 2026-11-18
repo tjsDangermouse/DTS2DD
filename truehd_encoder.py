@@ -39,6 +39,7 @@ from media_probe import subprocess_flags
 
 # FFmpeg channel order for each supported layout.
 LAYOUT_CHANNELS: Dict[str, List[str]] = {
+    "stereo": ["FL", "FR"],
     "5.1(side)": ["FL", "FR", "FC", "LFE", "SL", "SR"],
     "7.1": ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
 }
@@ -52,7 +53,12 @@ LAYOUT_CHANNELS: Dict[str, List[str]] = {
 #                       downmix it to 5.1 if the layout were not forced.
 SUPPORTED_LAYOUTS = ("5.1(side)", "7.1")
 
-LAYOUT_LABELS = {"5.1(side)": "5.1", "7.1": "7.1"}
+# Stereo is self-tested too, but only offered for FLAC sources (FLAC 2.0 ->
+# TrueHD 2.0). DTS-HD MA conversion stays limited to SUPPORTED_LAYOUTS.
+STEREO_LAYOUT = "stereo"
+TESTED_LAYOUTS = SUPPORTED_LAYOUTS + (STEREO_LAYOUT,)
+
+LAYOUT_LABELS = {"5.1(side)": "5.1", "7.1": "7.1", "stereo": "2.0"}
 
 CHANNEL_NAMES = {
     "FL": "Front Left", "FR": "Front Right", "FC": "Centre",
@@ -63,6 +69,7 @@ CHANNEL_NAMES = {
 
 # Dolby TrueHD allows 8 channels up to 96 kHz and 6 channels up to 192 kHz.
 SAMPLE_RATES_BY_CHANNELS = {
+    2: (44100, 48000, 88200, 96000, 176400, 192000),
     8: (44100, 48000, 88200, 96000),
     6: (44100, 48000, 88200, 96000, 176400, 192000),
 }
@@ -80,6 +87,7 @@ TRUEHD_CHANNEL_BITS = [
 
 # Expected (6-channel presentation, 8-channel presentation) assignments.
 EXPECTED_CHANNEL_ASSIGNMENT = {
+    "stereo": (0x01, 0x01),      # L/R only (as written by FFmpeg's mlpenc for 2.0)
     "5.1(side)": (0x0F, 0x0F),   # L/R C LFE Ls/Rs
     "7.1": (0x0F, 0x4F),         # 8ch: L/R C LFE Ls/Rs Lrs/Rrs
 }
@@ -479,7 +487,7 @@ class EncoderReport:
     def verified_layouts(self) -> List[str]:
         """Layouts where every bit-depth test passed."""
         layouts = []
-        for layout in SUPPORTED_LAYOUTS:
+        for layout in TESTED_LAYOUTS:
             results = [t for t in self.tests if t.layout == layout]
             if results and all(t.passed for t in results):
                 layouts.append(layout)
@@ -638,7 +646,7 @@ def check_encoder(
         log(f"  Advertised layouts: {' '.join(caps.layouts) or 'none'}")
 
     with tempfile.TemporaryDirectory(prefix="dts2dd-selftest-") as workdir:
-        for layout in SUPPORTED_LAYOUTS:
+        for layout in TESTED_LAYOUTS:
             for bits in (24, 16):
                 if layout not in caps.layouts:
                     report.tests.append(LayoutTest(layout, bits, False, "layout not advertised"))
@@ -658,12 +666,13 @@ def check_encoder(
                     log(f"  Self-test {LAYOUT_LABELS[layout]} {bits}-bit: {mark} - {test.detail}")
 
     verified = report.verified_layouts
+    stereo_note = "; TrueHD 2.0 also verified (used for FLAC 2.0)" if STEREO_LAYOUT in verified else ""
     first_failure = lambda layout: next(
         (t.detail for t in report.tests if t.layout == layout and not t.passed), "")
     if "7.1" in verified:
         report.status = STATUS_READY
         report.message = ("TrueHD 5.1 and 7.1 verified bit-exact" if "5.1(side)" in verified
-                          else "TrueHD 7.1 verified bit-exact (5.1 not verified)")
+                          else "TrueHD 7.1 verified bit-exact (5.1 not verified)") + stereo_note
     elif "7.1" not in caps.layouts:
         report.status = STATUS_NO_71
         report.message = ("This encoder's TrueHD encoder does not support 7.1 "
@@ -700,6 +709,10 @@ class TrueHDJob:
     make_default: bool = False
     remove_streams: Tuple[int, ...] = ()   # other ticked audio/subtitle tracks to drop
     removed_other_audio: int = 0           # how many of remove_streams are audio
+    # Decoder layout of the source when it differs from ``layout`` only in
+    # channel names (FLAC 6-channel "5.1" = back surrounds). The channels are
+    # relabelled by position with channelmap - no mixing, samples unchanged.
+    source_layout: Optional[str] = None
 
     @property
     def new_audio_index(self) -> int:
@@ -742,7 +755,8 @@ def build_truehd_command(encoder: str, job: TrueHDJob,
     * The output layout, sample format and rate are forced to the source's
       values, so FFmpeg can never insert a silent downmix or resample - the
       encoder fails instead.
-    * No filters are used: no normalisation, DRC, EQ or remixing.
+    * No normalisation, DRC, EQ or remixing. The only filter ever used is a
+      positional channel relabel (``job.source_layout``, FLAC 5.1 only).
     * The header declares an 18 Mb/s peak data rate (see TRUEHD_PEAK_BITRATE);
       ``packet_sizes_path`` records every access unit's size so the app can
       prove each one fits.
@@ -759,6 +773,10 @@ def build_truehd_command(encoder: str, job: TrueHDJob,
         "-c", "copy",
         f"-c:a:{k}", "truehd",
         f"-strict:a:{k}", "experimental",
+    ]
+    if job.source_layout and job.source_layout != job.layout:
+        cmd += [f"-filter:a:{k}", f"channelmap=channel_layout={job.layout}"]
+    cmd += [
         f"-ch_layout:a:{k}", job.layout,
         f"-sample_fmt:a:{k}", job.sample_fmt,
         f"-ar:a:{k}", str(job.sample_rate),

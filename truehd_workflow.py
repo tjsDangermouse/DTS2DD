@@ -1,6 +1,6 @@
-"""DTS-HD MA -> Dolby TrueHD conversion workflow with verification.
+"""DTS-HD MA / FLAC -> Dolby TrueHD conversion workflow with verification.
 
-Pipeline: DTS-HD MA (lossless XLL) -> integer PCM -> TrueHD -> Matroska,
+Pipeline: DTS-HD MA (lossless XLL) or FLAC -> integer PCM -> TrueHD -> Matroska,
 in a single LibreMPEG process with every other stream copied. The source
 file is never written to. The result is first written to a hidden temporary
 file in the source folder, verified, and only then renamed to the final
@@ -41,18 +41,83 @@ PACKET_CHECK_SECONDS = 300.0
 # Source validation
 # --------------------------------------------------------------------------
 
+# FLAC decoder layout -> TrueHD layout. FLAC's default 6-channel order is
+# FL FR FC LFE + a surround pair FFmpeg names "back" ("5.1"); in TrueHD that
+# pair is the Ls/Rs surround pair, so it is relabelled by position (no
+# mixing, samples unchanged). Everything else must already match.
+FLAC_LAYOUTS = {
+    "stereo": "stereo",
+    "5.1(side)": "5.1(side)",
+    "5.1": "5.1(side)",
+    "7.1": "7.1",
+}
+# Integer sample formats of the FLAC decoder -> planar format for the encoder.
+FLAC_SAMPLE_FORMATS = {"s16": "s16p", "s16p": "s16p", "s32": "s32p", "s32p": "s32p"}
+
+
+def is_flac(stream: AudioStreamInfo) -> bool:
+    return (stream.codec_name or "").lower() == "flac"
+
+
+def truehd_target_layout(stream: AudioStreamInfo) -> Optional[str]:
+    """Layout the TrueHD track will have (None when not convertible)."""
+    if is_flac(stream):
+        return FLAC_LAYOUTS.get(stream.channel_layout or "")
+    return stream.channel_layout if stream.channel_layout in SUPPORTED_LAYOUTS else None
+
+
+def encoder_sample_format(stream: AudioStreamInfo) -> Optional[str]:
+    if is_flac(stream):
+        return FLAC_SAMPLE_FORMATS.get(stream.sample_fmt or "")
+    return stream.sample_fmt
+
+
+def flac_source_problems(layout: Optional[str], channels: Optional[int], sample_rate: Optional[int],
+                         bit_depth: Optional[int], sample_fmt: Optional[str]) -> List[str]:
+    """Source-side reasons a FLAC track cannot be converted losslessly (no encoder check)."""
+    problems = []
+    target = FLAC_LAYOUTS.get(layout or "")
+    if target is None:
+        problems.append(
+            f"FLAC channel layout '{layout or 'unknown'}' ({channels or '?'} channels) is not supported. "
+            "Supported: 2.0, 5.1 and 7.1. No channel conversion or downmix is done automatically.")
+        return problems
+    if sample_fmt not in FLAC_SAMPLE_FORMATS:
+        problems.append(f"The FLAC decoder reports sample format '{sample_fmt}', which is not integer PCM.")
+    if bit_depth is not None and bit_depth > 24:
+        problems.append(f"{bit_depth}-bit FLAC cannot be stored losslessly in TrueHD (24-bit maximum).")
+    rates = SAMPLE_RATES_BY_CHANNELS.get(channels or 0, ())
+    if sample_rate not in rates:
+        problems.append(f"{sample_rate} Hz with {channels} channels is not a valid Dolby TrueHD "
+                        "configuration; resampling would not be lossless.")
+    return problems
+
+
+def validate_flac_source(stream: AudioStreamInfo, report: Optional[EncoderReport]) -> List[str]:
+    problems = flac_source_problems(stream.channel_layout, stream.channel_count, stream.sample_rate,
+                                    stream.bit_depth, stream.sample_fmt)
+    target = truehd_target_layout(stream)
+    if target and (report is None or not report.can_encode(target)):
+        problems.append(
+            f"The configured TrueHD encoder has not passed the {LAYOUT_LABELS[target]} self-test."
+            + (f" ({report.status}: {report.message})" if report else ""))
+    return problems
+
+
 def validate_source(stream: AudioStreamInfo, report: Optional[EncoderReport]) -> List[str]:
     """Return blocking problems for converting ``stream`` (empty when OK)."""
     problems = []
     if stream.format_name is None:
         return ["Detailed stream information is unavailable (ffprobe not found), "
                 "so the channel layout cannot be verified."]
+    if is_flac(stream):
+        return validate_flac_source(stream, report)
 
     probe_like = {"codec_name": stream.codec_name.lower(), "profile": stream.profile}
     if not is_lossless_dts_hd_ma(probe_like):
         problems.append(
             f"The selected track is {stream.format_name}. TrueHD conversion is only "
-            "offered for DTS-HD Master Audio, because other formats are lossy and "
+            "offered for DTS-HD Master Audio and FLAC, because other formats are lossy and "
             "a TrueHD copy would not be lossless relative to the original master."
         )
         return problems
@@ -95,6 +160,13 @@ def validate_source(stream: AudioStreamInfo, report: Optional[EncoderReport]) ->
 
 def source_warnings(stream: AudioStreamInfo) -> List[str]:
     warnings = []
+    if is_flac(stream):
+        warnings.append("Converting FLAC to TrueHD does not create Dolby Atmos; the result is "
+                        "channel-based TrueHD with exactly the same samples.")
+        if stream.channel_layout == "5.1":
+            warnings.append("FLAC's 6-channel order names the surround pair 'back'. It is carried as "
+                            "the 5.1 surround (Ls/Rs) pair in TrueHD; channel order and samples are "
+                            "unchanged.")
     if stream.profile and "DTS:X" in stream.profile:
         warnings.append("DTS:X object metadata cannot be carried into TrueHD; the lossless "
                         "7.1/5.1 channel bed is converted. The result is NOT Dolby Atmos.")
@@ -275,14 +347,15 @@ class TrueHDConverter:
             output_path=temp_path,
             source_stream_index=stream.stream_index,
             audio_stream_count=len(streams),
-            layout=stream.channel_layout,
-            sample_fmt=stream.sample_fmt,
+            layout=truehd_target_layout(stream),
+            sample_fmt=encoder_sample_format(stream),
             sample_rate=stream.sample_rate,
             language=stream.language,
             remove_source=remove_source,
             make_default=options.make_default,
             remove_streams=remove_streams,
             removed_other_audio=sum(1 for i in remove_streams if removable[i] == "audio"),
+            source_layout=stream.channel_layout,
         )
 
         # Strict verification fingerprints (small files in the system temp folder)
@@ -396,9 +469,13 @@ class TrueHDConverter:
         self.log("========================================")
         self.log("Starting Dolby TrueHD conversion" + (" (TEST CLIP)" if clip_seconds else ""))
         self.log(f"  Input: {source.name}")
+        decode = "lossless FLAC decode" if is_flac(stream) else "lossless XLL decode"
         self.log(f"  Source: {stream.format_name} {stream.channel_layout}, "
                  f"{stream.channel_count} ch, {stream.sample_rate} Hz, "
-                 f"{stream.bit_depth or '?'}-bit ({stream.sample_fmt} - lossless XLL decode)")
+                 f"{stream.bit_depth or '?'}-bit ({stream.sample_fmt} - {decode})")
+        if job.source_layout and job.source_layout != job.layout:
+            self.log(f"  Channel labels: {job.source_layout} -> {job.layout} (relabelled by position, "
+                     "samples unchanged)")
         for v in streams_of_type(probe, "video"):
             self.log(f"  Video (copied, not re-encoded): {describe_video(v)}")
         self.log(f"  Output: {job.title}, {stream.channel_count} ch, {stream.sample_rate} Hz")
@@ -467,8 +544,8 @@ class TrueHDConverter:
                             f"codec {new.get('codec_name')}"))
         checks.append(Check("Channel count", int(new.get("channels") or 0) == stream.channel_count,
                             f"{new.get('channels')} (expected {stream.channel_count})"))
-        checks.append(Check("Channel layout", new.get("channel_layout") == stream.channel_layout,
-                            f"{new.get('channel_layout')} (expected {stream.channel_layout})"))
+        checks.append(Check("Channel layout", new.get("channel_layout") == job.layout,
+                            f"{new.get('channel_layout')} (expected {job.layout})"))
         checks.append(Check("Sample rate", int(new.get("sample_rate") or 0) == stream.sample_rate,
                             f"{new.get('sample_rate')} Hz"))
         checks.append(Check("Not labelled Atmos", "atmos" not in (new.get("profile") or "").lower()

@@ -40,6 +40,19 @@ DTS to AC-3/DD+ Converter: A cross-platform GUI application that converts DTS au
 
 **truehd_workflow.py** - `TrueHDConverter.convert()`: validate source -> disk space -> hidden temp in source dir -> (clip: stream-copy cut first) -> encode -> `_verify_output()` checks -> optional `_strict_compare()` (streams both decodes as s32le and compares) -> rename to `_Sound_TrueHD.mkv` or leave for GUI-confirmed `finalize_replace()`
 
+**Library Scanner** (tab 2 of the main window; read-only scan, explicit repairs)
+- `media_inspector.py`: `inspect_file()` -> `MediaReport` (ffprobe always; MediaInfo `--Output=JSON` / `mkvmerge -J` when found; 2 decoded frames for HDR10+; stream-copied 4 s samples at start + middle of E-AC-3/AC-3/TrueHD tracks). `INSPECTOR_VERSION` invalidates the cache when the report changes
+- `atmos_inspector.py`: full E-AC-3 bsi parser up to addbsi (`flag_ec3_extension_type_a` + complexity index = JOC), TrueHD major sync `substream_info & 0x80` (16-ch presentation). Classification needs >=30 frames to call JOC absent; any tool disagreement -> "Manual inspection recommended". Validated only against FFmpeg-encoded E-AC-3 with JOC signalling inserted (`tests/eac3_fixtures.py`; FFmpeg then reports the Atmos profile) - never against real Atmos masters
+- `compatibility_rules.py`: `@rule` registry, `ScannerConfig` (settings key `library_scanner`), `DEVICE_PROFILES`, `subtitle_cleanup_plan()` (unlabelled kept unless confirmed; >=1 regular English always kept). Device rules have `device=` and are potential problems only
+- `library_scanner.py`: `find_media_files`, `ScanCache` (user_data_dir()/library_scan_cache.json, size+mtime_ns), thread pool, ETA from uncached files. Findings are recomputed from cached reports
+- `library_repair.py`: `plan_repair()` -> one pass per file (TrueHD via `TrueHDConverter` with subtitle removal folded in; AC-3/E-AC-3 via `convert_and_append_audio`; else `remux_in_place`), `validate_output()` before replace, `run_batch()`; skips files changed since the scan; MKV only
+- `scanner_ui.py`: tab, `RepairDialog` (plan preview), `SettingsDialog`. Never name dialog methods `_options`/`_config` - they shadow tkinter internals
+
+**Queue** (tab 3)
+- `job_queue.py`: `JobQueue` (user_data_dir()/job_queue.json, saved on every change; RUNNING -> INTERRUPTED on load), `QueueRunner` (takes the next QUEUED job each time, so edits during a run apply; `stop_after_current`, shared `cancelled` event), `TrackRef` / `resolve_ref` (signature + position among identical tracks; refuses when ambiguous)
+- `queue_jobs.py`: job builders (`convert_job`, `removal_job`, `truehd_job` from the Convert tab; `repair_job` from the scanner - stores the requested actions/options and RE-PLANS at run time) and executors calling the existing workflows. `QueueEnv.new_handle()` pre-cancels if the queue was cancelled between jobs
+- `queue_ui.py`: tab; `ConverterApp.set_external_busy()` derives busy from scanner repairs + queue; `job_finished()` refreshes the Convert tab and scanner row
+
 **app_paths.py** - `app_dir()` (exe folder when frozen), `user_data_dir()` (%LOCALAPPDATA%\DTS2DD), `ffmpeg_folders()`: bundled `ffmpeg/` beside the exe -> (PATH, checked in ffmpeg_downloader) -> per-user download folder -> legacy `./ffmpeg`. Never write into the program folder.
 
 **app_settings.py** - JSON settings in %APPDATA%/DTS2DD (or `DTS2DD_SETTINGS_DIR`); stores `truehd_encoder_path`
@@ -78,6 +91,8 @@ Main thread uses `root.after()` to safely update GUI from worker threads. Never 
 - Seeking (`-ss`) and encoding in one pass gave the TrueHD track a ~250 ms late start. Test clips are therefore cut by stream copy first, then converted like a whole file.
 - Strict verification is hash-based: the encode command has a second output (`-map 0:<src> -c:a pcm_s32le -f hash -hash sha256 <file>`) that fingerprints the exact PCM fed to the encoder; afterwards the independent FFmpeg decodes the TrueHD track FROM THE MKV and hashes it. The source film is never re-read (the old two-decoder comparison took ~50 min on a 36 GB film). Decoding from the MKV is deliberate - it is what exposes container bugs like the DiscardPadding one. `_locate_difference` (slow side-by-side compare) only runs after a mismatch, to report where.
 - The 2ch/6ch embedded presentations are channel subsets, not downmixes.
+- FLAC: FFmpeg decodes every 6-ch FLAC as `5.1` (back). It is relabelled by position to `5.1(side)` with `-filter:a:k channelmap=channel_layout=5.1(side)` (`TrueHDJob.source_layout`) - bit-exact. FLAC s16/s32 -> s16p/s32p. Stereo is self-tested (`TESTED_LAYOUTS`) and offered only for FLAC; header assignment 0x01/0x01.
+- ffmpeg CLI auto-flags the first track of a type "default" when >=2 remain, none is default and NO `-disposition` was given (e.g. after removing subtitles). `keep_dispositions_args()` passes stream 0's own flags to disable that; used by track removal, legacy AC-3 append and the scanner remux.
 - Peak data rate: unpatched mlpenc declares 9.6 Mb/s with constant input timing -> every AU must be <= 1000 B at 48 kHz. Spectre 0:34.5 hit 1018 B and the Denon glitched (VLC clean). We patch LibreMPEG (`installer/patches/`) with a `peak_bitrate` option, declare 18 Mb/s, record AU sizes via `-stats_enc_post ... {size}` during the encode and fail if any exceeds the header's limit (`check_access_unit_sizes`). Note AU sizes depend on where encoding starts, so reproduce issues from the same start time.
 - Worst case (incompressible full-scale noise, measured): max AU 1248 B for 7.1/48k, 934 B for 5.1/48k, 1648 B for 5.1/96k - always under the 1875 B limit at 18 Mb/s. 7.1/96k (2192 B) and 5.1/192k (3094 B) CAN exceed; the AU-size check then fails the conversion. LibreMPEG output is ~30% larger than raw PCM on noise (Dolby's encoder is far more efficient).
 - zlib: LibreMPEG built with `--disable-autodetect` lacks zlib and copies zlib-compressed MKV tracks (PGS subtitles) still compressed = corrupted. CI builds with `--enable-zlib`; `check_encoder` refuses builds without zlib or the peak option; `_check_copied_packets` compares every copied track (first 5 min / whole clip) against the original, both read by the standard FFmpeg.
@@ -192,6 +207,15 @@ truehd_encoder.py         # LibreMPEG TrueHD backend + self-test
 truehd_workflow.py        # TrueHD conversion/verification workflow
 app_settings.py           # Persistent settings
 app_paths.py              # Program / per-user folders, bundled tool lookup
+scanner_ui.py             # Library Scanner tab + dialogs
+library_scanner.py        # Recursive scan, cache, progress
+media_inspector.py        # ffprobe/MediaInfo/mkvmerge/bitstream inspection
+atmos_inspector.py        # E-AC-3 JOC / TrueHD Atmos parsing + classification
+compatibility_rules.py    # Rules, device profiles, subtitle policy
+library_repair.py         # Repair plans, validation, batches
+job_queue.py              # Persistent queue + runner + track references
+queue_jobs.py             # Queue job builders / executors
+queue_ui.py               # Queue tab
 version.py                # App version (window title, installer, release tag)
 installer/                # Inno Setup script + third-party notices
 .github/workflows/        # Windows installer build + tests

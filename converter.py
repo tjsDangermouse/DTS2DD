@@ -20,9 +20,12 @@ from truehd_encoder import (
     TrueHDError, check_encoder, create_channel_test_file,
 )
 from version import __version__
+from scanner_ui import LibraryScannerTab
+from queue_ui import QueueTab
+from queue_jobs import convert_job, removal_job, truehd_job
 from truehd_workflow import (
     TrueHDConverter, TrueHDOptions, find_stale_partials, output_name, source_warnings,
-    validate_source,
+    truehd_target_layout, validate_source,
 )
 
 CODEC_AC3 = "AC-3 (Dolby Digital)"
@@ -43,7 +46,7 @@ class ConverterApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"DTS to AC-3 Converter {__version__}")
-        self.root.geometry("860x900")
+        self.root.geometry("1000x900")
         self.root.minsize(760, 640)
         self.ffmpeg_path = None
         self.ffprobe_path = None
@@ -57,8 +60,11 @@ class ConverterApp:
         self.encoder_report = None
         self.encoder_checking = False
         self.busy = False
+        self.external_busy = False      # a Library Scanner repair is writing files
         self.job_handle = None
         self.job_thread = None
+        self.scanner = None
+        self.queue_tab = None
 
         self._create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -84,7 +90,7 @@ class ConverterApp:
                 self._ui(self._check_truehd_encoder)
 
             except RuntimeError as e:
-                self.root.after(0, lambda: self._show_error(str(e)))
+                self._ui(self._show_error, str(e))
 
         thread = threading.Thread(target=get_ffmpeg, daemon=True)
         thread.start()
@@ -130,8 +136,16 @@ class ConverterApp:
         self.status_label = Label(self.root, text="", fg="blue")
         self.status_label.pack(pady=5)
 
-        main_frame = Frame(self.root, padx=10, pady=10)
-        main_frame.pack(fill=BOTH, expand=True)
+        # Two tabs: the original single-file converter, and the Library Scanner.
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=BOTH, expand=True)
+        main_frame = Frame(self.notebook, padx=10, pady=10)
+        self.notebook.add(main_frame, text="Convert File")
+        self.scanner = LibraryScannerTab(self.notebook, self)
+        self.notebook.add(self.scanner.frame, text="Library Scanner")
+        self.queue_tab = QueueTab(self.notebook, self)
+        self.notebook.add(self.queue_tab.frame, text="Queue")
+        self.queue_tab.refresh()
 
         # File selection frame
         file_frame = LabelFrame(main_frame, text="Input File", padx=10, pady=10)
@@ -240,6 +254,13 @@ class ConverterApp:
         )
         self.convert_button.pack(side="left", padx=5)
 
+        self.queue_button = Button(
+            button_frame, text="Add to Queue",
+            command=self._queue_conversion,
+            state="disabled"
+        )
+        self.queue_button.pack(side="left", padx=5)
+
         Button(
             button_frame, text="Detect Audio",
             command=self._detect_audio
@@ -258,6 +279,12 @@ class ConverterApp:
             state="disabled"
         )
         self.remove_tracks_button.pack(side="left", padx=(20, 5))
+        self.queue_removal_button = Button(
+            button_frame, text="Queue Removal",
+            command=self._queue_track_removal,
+            state="disabled"
+        )
+        self.queue_removal_button.pack(side="left", padx=5)
         self.ticked_label = Label(button_frame, text="", fg="#b36b00", anchor="w")
         self.ticked_label.pack(side="left", padx=5, fill="x", expand=True)
 
@@ -533,23 +560,44 @@ class ConverterApp:
             elif problems:
                 self.compat_label.config(text="✗ " + problems[0], fg="#b00020")
             else:
-                text = (f"✓ {stream.format_name} {LAYOUT_LABELS[stream.channel_layout]} "
+                label = LAYOUT_LABELS[truehd_target_layout(stream)]
+                text = (f"✓ {stream.format_name} {label} "
                         f"({stream.channel_count} ch, {stream.sample_rate} Hz, "
                         f"{stream.bit_depth or '?'}-bit) → Dolby TrueHD "
-                        f"{LAYOUT_LABELS[stream.channel_layout]}, lossless")
+                        f"{label}, lossless")
                 for warning in source_warnings(stream):
                     text += f"\n⚠ {warning}"
                 self.compat_label.config(text=text, fg="#1b7f2a")
         self._refresh_convert_state()
 
+    def set_external_busy(self, busy: bool = False):
+        """Called by the Library Scanner / Queue when their jobs start or stop writing files."""
+        self.external_busy = bool((self.scanner and self.scanner.repairing)
+                                  or (self.queue_tab and self.queue_tab.running))
+        self._refresh_convert_state()
+
+    def job_finished(self, path: str):
+        """A queued job changed ``path``: refresh this tab and the scanner row (main thread)."""
+        if self.current_file and os.path.abspath(self.current_file) == os.path.abspath(path) and not self.busy:
+            self._detect_audio()
+        if self.scanner and path in self.scanner.items:
+            tools = self.scanner._tools()
+            threading.Thread(target=self.scanner._rescan, args=(path, "Queued job finished", tools),
+                             daemon=True).start()
+
     def _refresh_convert_state(self):
-        ready = not self.busy and self._selected_stream() is not None
+        ready = not self.busy and not self.external_busy and self._selected_stream() is not None
         if ready and self._is_truehd():
             ready = not self._truehd_problems()
         self.convert_button.config(state="normal" if ready else "disabled")
+        # Queuing never touches the file, so it is allowed while other work runs.
+        queueable = self._selected_stream() is not None and not (self._is_truehd() and self._truehd_problems())
+        self.queue_button.config(state="normal" if queueable else "disabled")
         audio, subtitles = self._ticked()
         count = len(audio) + len(subtitles)
-        self.remove_tracks_button.config(state="normal" if count and not self.busy else "disabled")
+        self.remove_tracks_button.config(state="normal" if count and not self.busy and not self.external_busy
+                                         else "disabled")
+        self.queue_removal_button.config(state="normal" if count else "disabled")
         subs = self.subtitle_streams
         self.subs_all_var.set(bool(subs) and len(subtitles) == len(subs))
         self.subs_all_check.config(state="normal" if subs and not self.busy else "disabled")
@@ -587,7 +635,7 @@ class ConverterApp:
                 self._log(f"Found {len(streams)} audio stream(s), {len(subtitles)} subtitle track(s)")
 
             except RuntimeError as e:
-                self.root.after(0, lambda: self._update_audio_display_error(str(e)))
+                self._ui(self._update_audio_display_error, str(e))
                 self._log(f"Error: {str(e)}")
 
         thread = threading.Thread(target=detect, daemon=True)
@@ -768,6 +816,19 @@ class ConverterApp:
             threading.Thread(target=self.job_handle.cancel, daemon=True).start()
 
     def _on_close(self):
+        if self.queue_tab and self.queue_tab.running:
+            if not messagebox.askyesno("Queue running",
+                                       "The queue is running. Stop it and quit?\n\n"
+                                       "The film being processed is left unchanged; the other jobs stay "
+                                       "queued for next time."):
+                return
+            self.queue_tab.shutdown()
+        if self.scanner and self.scanner.busy:
+            if not messagebox.askyesno("Library Scanner running",
+                                       "A library scan or repair is running. Stop it and quit?\n\n"
+                                       "A file being repaired is left unchanged."):
+                return
+            self.scanner.shutdown()
         if self.busy and self.job_handle:
             if not messagebox.askyesno("Conversion running",
                                        "A conversion is running. Cancel it and quit?\n\n"
@@ -882,6 +943,69 @@ class ConverterApp:
 
         self.job_thread = threading.Thread(target=convert, daemon=True)
         self.job_thread.start()
+
+    # ------------------------------------------------------------------
+    # Queue
+    # ------------------------------------------------------------------
+
+    def _queue_conversion(self):
+        """Queue what Convert would do now, including ticked track removal."""
+        input_path = self.current_file
+        stream = self._selected_stream()
+        if not input_path or not os.path.exists(input_path) or stream is None:
+            messagebox.showwarning("Add to Queue", "Select an MKV file and an audio track first")
+            return
+        ticked_audio, ticked_subs = self._ticked()
+        removes = ticked_audio + ticked_subs
+        remove_source = self.remove_source_var.get() or stream in ticked_audio
+        try:
+            if self._is_truehd():
+                problems = self._truehd_problems()
+                if problems:
+                    messagebox.showerror("Cannot convert to TrueHD", "\n\n".join(problems))
+                    return
+                test_clip = self.test_clip_var.get()
+                try:
+                    clip_start = parse_timecode(self.clip_start_var.get()) if test_clip else 0.0
+                except ValueError as e:
+                    messagebox.showerror("Invalid start time", str(e))
+                    return
+                options = TrueHDOptions(
+                    remove_source=remove_source, make_default=self.make_default_var.get(),
+                    strict_verify=self.strict_verify_var.get(), test_clip=test_clip,
+                    clip_seconds=int(self.clip_length_var.get().split()[0]), clip_start=clip_start,
+                    replace_original=(self.output_mode_var.get() == "replace" and not test_clip),
+                )
+                if options.replace_original and not messagebox.askyesno(
+                        "Queue TrueHD conversion",
+                        "When this job runs, the original MKV will be replaced after verification passes, "
+                        "WITHOUT asking again.\n\nChoose No to keep the original and save a new "
+                        "…_Sound_TrueHD.mkv instead."):
+                    options.replace_original = False
+                job = truehd_job(input_path, self.audio_streams, self.subtitle_streams, stream, options, removes,
+                                 LAYOUT_LABELS[truehd_target_layout(stream)])
+            else:
+                codec = "eac3" if "E-AC-3" in self.codec_var.get() else "ac3"
+                job = convert_job(input_path, self.audio_streams, self.subtitle_streams, stream, codec,
+                                  self.bitrate_var.get(), remove_source, removes)
+        except OSError as e:
+            messagebox.showerror("Add to Queue", str(e))
+            return
+        self.queue_tab.add_jobs([job])
+        self._log(f"Added to queue: {job.name} - {job.summary}")
+
+    def _queue_track_removal(self):
+        input_path = self.current_file
+        audio, subtitles = self._ticked()
+        if not input_path or not os.path.exists(input_path) or not (audio or subtitles):
+            return
+        if len(audio) == len(self.audio_streams) and not messagebox.askyesno(
+                "Queue Removal", "This removes ALL audio tracks - the film will have no sound. Queue it anyway?",
+                icon="warning"):
+            return
+        job = removal_job(input_path, self.audio_streams, self.subtitle_streams, audio + subtitles)
+        self.queue_tab.add_jobs([job])
+        self._log(f"Added to queue: {job.name} - {job.summary}")
 
     def _start_track_removal(self):
         """Remove the ticked audio/subtitle tracks without converting anything."""

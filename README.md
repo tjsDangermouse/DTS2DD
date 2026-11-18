@@ -4,10 +4,16 @@ A Windows and macOS desktop app that adds a Dolby audio track to MKV files
 that only have DTS audio:
 
 - **Dolby Digital (AC-3)** or **Dolby Digital Plus (E-AC-3)** from any DTS track
-- **Dolby TrueHD (lossless)** from DTS-HD Master Audio 5.1 or 7.1, bit-for-bit
+- **Dolby TrueHD (lossless)** from DTS-HD Master Audio 5.1 or 7.1, or from
+  FLAC 2.0 / 5.1 / 7.1, bit-for-bit
 
 Video, subtitles, chapters and other tracks are copied untouched; only the
 new audio track is encoded.
+
+The **Library Scanner** tab checks a whole movie folder for files likely to
+cause playback problems (too many subtitle tracks, multichannel FLAC, Dolby
+Atmos signalling, Dolby Vision profiles, DTS-HD MA, track flags) and repairs
+selected files with the same safe workflows.
 
 ## Features
 
@@ -25,6 +31,11 @@ new audio track is encoded.
   error when something fails.
 - **Self-contained Windows installer**: FFmpeg and the TrueHD encoder are
   included, so there is nothing else to install or configure.
+- **Library Scanner**: recursive, read-only analysis of MKV (and MP4)
+  libraries with device profiles for Fire TV / Plex, Panasonic UB450 DLNA and
+  LG C5 Plex, plus individual or batch repairs (see below).
+- **Job queue**: queue different changes for different films from either tab
+  and run them one after another (see "Queue" below).
 
 ## Installation
 
@@ -126,6 +137,161 @@ Playback on Plex, Fire TV and AV receivers has **not** been verified by
 automated tests. See "Testing on Fire TV / Plex / Denon" in
 [USER_GUIDE.md](USER_GUIDE.md) for the manual check.
 
+## Library Scanner
+
+Open the **Library Scanner** tab, choose your movie folder and press **Scan**.
+Scanning never changes a file. Results are cached (by file name, size and
+modification time), so re-scanning only reads new or changed films.
+
+Each film gets a row with its video/HDR format, audio tracks, subtitle count,
+issues, severity and recommended repairs. Filters show all movies, issues
+only, subtitle warnings, FLAC audio, Atmos warnings, Dolby Vision or passed
+files. The details panel shows the confirmed file characteristics, every
+finding with the evidence behind it, and the original ffprobe / MediaInfo /
+bitstream metadata.
+
+Severities:
+
+| Severity | Meaning |
+|---|---|
+| Error | Strong evidence of a malformed or unsupported stream |
+| Warning | Likely device compatibility issue, or unverified metadata |
+| Information | A valid characteristic that may be relevant |
+
+File findings ("this is what the file contains") are kept separate from
+device findings ("this may not play well on this device"). A device finding
+never means the file is defective.
+
+### What is checked
+
+- **Subtitles**: track count (warning above 5, editable), codec, language,
+  missing / undetermined language tags, tags contradicting the title, forced
+  and default flags, possibly redundant English tracks.
+- **FLAC**: channels and layout, sample rate, bit depth, language, default
+  flag and the other audio tracks. Multichannel FLAC is reported as a
+  potential device issue, never as corrupt.
+- **Dolby Atmos**: E-AC-3 tracks are classified as *Valid DD+ Atmos (JOC
+  confirmed)*, *Conventional DD+*, *Atmos unverified*, *Atmos not detected
+  (limited evidence)* or *Manual inspection recommended*; TrueHD as *Valid
+  TrueHD Atmos*, *TrueHD (no Atmos signalled)* or *Atmos unverified*; AC-3
+  titled "Atmos" is flagged as misleading metadata. Track names alone are
+  never trusted (see below).
+- **Video**: Dolby Vision profile / level / compatibility ID / RPU, HDR10,
+  HDR10+ (from two decoded frames) and HLG. Profile 5 (no HDR10 fallback),
+  missing RPU and non-standard profile/compatibility combinations are flagged;
+  HDR10 fallback is never treated as corruption.
+- **DTS**: DTS, DTS-HD MA and DTS:X (from the ffprobe profile).
+- **Track metadata**: missing or multiple default audio tracks, missing or
+  contradicting language tags, titles that contradict the codec or channel
+  count, unexpected channel layouts, identical-looking audio tracks.
+
+### Device profiles (editable)
+
+| Profile | Flags |
+|---|---|
+| Fire TV Stick 4K Plus - Plex | DTS-HD MA possibly played as the lossy core; valid E-AC-3 JOC possibly output as PCM 5.1 ("Valid Atmos - potential Fire TV playback compatibility issue"); multichannel FLAC possibly output as stereo |
+| Panasonic UB450 - DLNA | Many PGS subtitle tracks (slow start-up - Spectre with 46 tracks took minutes, with 1 almost none); Dolby Vision in MKV; Opus / Vorbis audio |
+| LG C5 - Plex | Dolby Vision profile 7 (expect HDR10) and DV-in-MKV notes; lossless-only audio needing eARC passthrough |
+
+**Rules & Devices...** switches device profiles and any individual rule on or
+off, sets the subtitle threshold and preferences, and points the scanner at
+MediaInfo / MKVToolNix if they are not found automatically.
+
+### Repairs
+
+Select one or more rows and use **Clean Subtitles...**, **Convert FLAC to
+TrueHD...** or **Repair Selected...**. The repair dialog shows, per file,
+exactly which tracks will be kept and removed before anything starts.
+
+- **Clean subtitles**: keeps English (editable), English forced and SDH
+  tracks, and always at least one regular English track. Tracks without a
+  language tag are kept unless you tick their removal and confirm a second
+  prompt listing them.
+- **FLAC -> Dolby TrueHD**: 2.0, 5.1 and 7.1 using the existing LibreMPEG
+  TrueHD pipeline, only for layouts the installed encoder passed its
+  self-test for. Sample rate, bit depth, channel count and channel positions
+  are preserved; the FLAC track is kept by default; the TrueHD track can be
+  made the default. Every decoded sample is compared (SHA-256) with the FLAC.
+  FLAC's 6-channel order names the surround pair "back"; TrueHD carries it as
+  the 5.1 surround pair (a positional relabel - no mixing). Unsupported
+  layouts (mono, 6.1, 7.1 wide...), >24-bit audio and invalid rates are
+  refused. Converting FLAC to TrueHD does **not** create Dolby Atmos.
+- **Convert DTS**: the existing workflows - lossless TrueHD for DTS-HD MA
+  5.1/7.1 when possible, otherwise E-AC-3 / AC-3 at the chosen bitrate.
+- **Fix default audio**: leaves exactly one audio track flagged default.
+
+Several repairs for one file are combined into a single pass (e.g. FLAC ->
+TrueHD + subtitle cleanup). Video is never re-encoded. Each result is written
+to a temporary file, checked (track list, codecs, languages, titles, forced
+and default flags, video format / HDR / Dolby Vision metadata, chapters,
+attachments, duration, and byte-identical copied packets over the first 30
+seconds - the full TrueHD checks for TrueHD), and only then replaces the
+original; a failure or cancel leaves the original untouched. Disk space is
+checked first, files that changed since the scan are skipped, and a final
+report lists repaired, skipped and failed files. Repairs are only performed on
+MKV files (MP4 is analysed only). Atmos tracks are never re-encoded, renamed
+or given new metadata.
+
+## Queue
+
+Instead of starting a job straight away you can queue it and build up a list
+of work across many films:
+
+- **Convert File** tab: **Add to Queue** queues exactly what Convert would do
+  (AC-3 / E-AC-3 / TrueHD, including ticked tracks to remove); **Queue
+  Removal** queues removing the ticked tracks.
+- **Library Scanner** repair dialog: **Add to Queue** queues one repair job per
+  film (the per-file plan is shown first, as for Start Repairs Now).
+
+The **Queue** tab lists the jobs in the order they will run. Move jobs up or
+down, remove them, retry failed ones, and press **Start Queue** - jobs run one
+at a time from the top. **Stop After Current** finishes the running job and
+stops; **Cancel Current** stops it immediately (that film is left unchanged)
+and keeps the rest queued. You can keep adding jobs while the queue runs.
+When it finishes, a report lists what was done, skipped and failed.
+
+Several jobs for the same film are fine. Each job re-reads its film just
+before it runs: Library Scanner repairs are re-planned for the film as it is
+then, and Convert File jobs find their tracks again (by codec, channels,
+language, title and position) even if an earlier job removed or added tracks.
+If a track can no longer be identified with certainty, that job is skipped
+with the reason - it never guesses. TrueHD jobs set to "replace original" do
+so after verification without asking again (you confirm this when queuing).
+
+The queue is saved, so it is still there after restarting the app. A job that
+was running when the app closed is shown as Interrupted (its film is
+unchanged) and can be retried. While the queue runs, the Convert button and
+direct repairs are disabled so two jobs never write at the same time.
+
+### How Atmos is identified
+
+- **E-AC-3**: a few seconds from the start and the middle of the track are
+  stream-copied and every syncframe's bit stream information is parsed
+  (ETSI TS 102 366 Annex E) up to the additional bitstream info, where JOC is
+  signalled by `flag_ec3_extension_type_a` plus a complexity index (object
+  count). This is the field FFmpeg and MediaInfo use too. The scanner reports
+  JOC as *confirmed* only when it is set in every parsed frame; *absent* only
+  when at least 30 frames were parsed without it; anything mixed or
+  contradicted by ffprobe / MediaInfo is *manual inspection recommended*.
+- **TrueHD**: the major sync headers' 16-channel presentation flag
+  (substream info bit 7) and substream count, cross-checked with ffprobe's
+  profile and MediaInfo.
+- The parser was checked against FFmpeg-encoded E-AC-3 (mono, stereo, 2.1,
+  5.1; 32/44.1/48 kHz; with downmix and production metadata) by inserting the
+  JOC flag where the parser found the addbsi field and confirming FFmpeg then
+  reports the Atmos profile. It has **not** been validated against genuine
+  Atmos masters; the JOC object payload itself is not decoded.
+- A valid DD+ Atmos track that the Fire TV outputs as PCM 5.1 is a playback
+  chain limitation, not a damaged file; the scanner says so and does not
+  offer a "repair".
+
+### Optional tools
+
+ffprobe (bundled with FFmpeg) is always used. When found, **MediaInfo CLI**
+(`mediainfo`) adds Atmos / HDR format strings and **MKVToolNix**
+(`mkvmerge -J`) adds Matroska track flags and codec IDs. Both are free and
+optional; nothing is downloaded automatically and no online service is used.
+
 ## How It Works
 
 ### Finding FFmpeg
@@ -209,6 +375,11 @@ python tests/fetch_samples.py      # FFmpeg FATE DTS-HD MA + Dolby Vision sample
 DTS2DD_LIBREMPEG=/path/to/librempeg/ffmpeg python -m pytest tests -v
 ```
 
+Library Scanner tests: `tests/test_scanner_unit.py` (mocked metadata and
+synthetic bitstreams) and `tests/test_scanner_integration.py` (FFmpeg-made
+MKVs; FLAC -> TrueHD needs LibreMPEG, the Dolby Vision test needs the FATE
+sample). The "JOC" fixtures signal JOC but contain no Atmos audio.
+
 Unit tests need nothing else. Integration tests skip unless LibreMPEG,
 FFmpeg, ffprobe and the samples are available. The Windows installer is built
 and tested on Windows by GitHub Actions on every push
@@ -225,7 +396,16 @@ DTS2DD/
 ├── ffmpeg_downloader.py      # FFmpeg discovery and download
 ├── media_probe.py            # ffprobe JSON probing, format identification, video checks
 ├── truehd_encoder.py         # LibreMPEG discovery, self-test, TrueHD commands
-├── truehd_workflow.py        # TrueHD conversion, verification, safe output
+├── truehd_workflow.py        # TrueHD conversion (DTS-HD MA, FLAC), verification, safe output
+├── scanner_ui.py             # Library Scanner tab, repair and settings dialogs
+├── library_scanner.py        # Recursive scan, cache, progress, cancellation
+├── media_inspector.py        # ffprobe / MediaInfo / mkvmerge / bitstream sampling
+├── atmos_inspector.py        # E-AC-3 JOC and TrueHD Atmos bitstream analysis
+├── compatibility_rules.py    # Rules, device profiles, subtitle policy, settings
+├── library_repair.py         # Repair planning, combined passes, validation, batches
+├── job_queue.py              # Persistent job queue, track references, sequential runner
+├── queue_jobs.py             # Queue jobs from both tabs and their executors
+├── queue_ui.py               # Queue tab
 ├── audio_stream_info.py      # Audio stream data model
 ├── app_paths.py              # Program and per-user folders
 ├── app_settings.py           # Persistent settings

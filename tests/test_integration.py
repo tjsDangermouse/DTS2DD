@@ -64,7 +64,8 @@ class EncoderSelfTests(Workdir):
     def test_a_b_librempeg_verified_for_51_and_71(self):
         report = encoder_report()
         self.assertEqual(report.status, te.STATUS_READY, report.message)
-        self.assertEqual(report.verified_layouts, ["5.1(side)", "7.1"])
+        # stereo is self-tested too (offered only for FLAC 2.0 sources)
+        self.assertEqual(report.verified_layouts, ["5.1(side)", "7.1", "stereo"])
         self.assertTrue(all(t.passed for t in report.tests))
 
     def test_e_standard_ffmpeg_lacks_71(self):
@@ -487,7 +488,10 @@ class PackagingTests(unittest.TestCase):
             self.assertTrue(any(Path(d, "dist").iterdir()), "no build output")
             if warn.exists():
                 text = warn.read_text()
-                for module in ("truehd_encoder", "truehd_workflow", "media_probe", "app_settings"):
+                for module in ("truehd_encoder", "truehd_workflow", "media_probe", "app_settings",
+                               "scanner_ui", "library_scanner", "media_inspector", "compatibility_rules",
+                               "atmos_inspector", "library_repair", "job_queue", "queue_jobs",
+                               "queue_ui"):
                     self.assertNotIn(f"No module named '{module}'", text)
 
 

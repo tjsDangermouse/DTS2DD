@@ -143,6 +143,8 @@ labels the new track as Atmos.
 | DTS-HD MA 6.1 | Refused - output was not bit-exact in testing |
 | DTS-HD MA 5.1 with rear (back) surrounds | Refused - signalled without surrounds for 5.1 decoders |
 | DTS, DTS-ES, DTS 96/24, DTS-HD High Resolution, DTS Express | Refused - these are lossy, so TrueHD would not be lossless relative to the master |
+| FLAC 2.0 / 5.1 / 7.1, up to 24-bit | Dolby TrueHD 2.0 / 5.1 / 7.1, bit-identical (FLAC 5.1's "back" surround pair becomes the TrueHD surround pair; samples unchanged) |
+| FLAC mono, 6.1, 7.1 "wide", >24-bit | Refused |
 
 Nothing is ever downmixed, upmixed, resampled, normalised, compressed or
 equalised. If a track cannot be converted exactly, conversion is disabled and
@@ -309,6 +311,66 @@ Denon is **unverified**.
 - Speed: on an Apple-silicon Mac, encoding ran at about 44x real time; a full
   film is usually limited by disk speed (the whole MKV is read and written).
 
+
+## Library Scanner
+
+The **Library Scanner** tab checks a whole folder of films. Scanning only
+reads files; nothing changes until you start a repair yourself.
+
+1. Choose the folder (sub-folders are included) and press **Scan**. Progress,
+   the current file, the number with issues and the estimated time left are
+   shown. **Cancel** stops at any time. A second scan only reads new or
+   changed films; tick **Rescan all** to re-read everything.
+2. Use **Show** to filter (issues only, subtitle warnings, FLAC, Atmos
+   warnings, Dolby Vision, passed). Click a column heading to sort.
+3. Click a film to see what it contains, each finding with its evidence, and
+   the original metadata. "Device-specific potential problems" are about your
+   playback equipment, not faults in the file.
+4. Select films (Ctrl/Cmd-click, Shift-click or **Select all shown**) and
+   choose **Clean Subtitles...**, **Convert FLAC to TrueHD...** or **Repair
+   Selected...**. The dialog lists, per film, every track that will be kept
+   or removed. Change the options, check the plan, then **Start Repairs**.
+5. When the batch finishes a report lists what was repaired, skipped and why,
+   and what failed. Repaired films are re-scanned automatically.
+
+Good to know:
+
+- Subtitle tracks without a language tag are never removed unless you tick
+  that option *and* confirm the list shown.
+- E-AC-3 "DD+ Atmos" that your Fire TV plays as PCM 5.1 is reported as
+  **Valid Atmos - potential Fire TV playback compatibility issue**. The file
+  is fine; check the Fire TV's audio output setting and Plex passthrough.
+  The app never re-encodes Atmos tracks or renames tracks.
+- A title saying "Atmos" on a track that does not signal Atmos is reported as
+  misleading metadata; the app does not change titles.
+- **Rules & Devices...** turns device profiles and individual checks on or
+  off and changes the subtitle threshold and languages to keep.
+- MediaInfo CLI and MKVToolNix are used automatically when installed and add
+  extra evidence; they are optional.
+
+Device behaviour (Fire TV, UB450, LG C5, Denon) cannot be tested
+automatically. After a repair, play the film and check the receiver's
+display: TrueHD / Dolby Atmos / PCM and the channel count, and how quickly the
+UB450 starts playback.
+
+## Queue: many changes on many films
+
+1. In **Convert File**, choose a film, track and format as usual, then press
+   **Add to Queue** instead of Convert (or tick tracks and press **Queue
+   Removal**). Pick the next film and repeat.
+2. In **Library Scanner**, select films, open a repair, check the plan and
+   press **Add to Queue**.
+3. Open the **Queue** tab. Use **Move Up / Move Down** to change the order,
+   **Remove** to drop a job, then press **Start Queue** and confirm.
+4. Jobs run one by one. **Stop After Current** pauses cleanly; **Cancel
+   Current** stops the running job (its film is not changed). Failed or
+   skipped jobs can be selected and **Retry**-ed.
+
+You can queue several changes for the same film (for example: remove a
+commentary track, then convert DTS to E-AC-3, then clean subtitles). Each job
+looks at the film again just before it runs. If an earlier job made a track
+impossible to identify, the later job is skipped and the report says why.
+The queue is kept when you close the app.
 
 ## Common Scenarios
 

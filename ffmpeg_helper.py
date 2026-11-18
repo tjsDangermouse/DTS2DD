@@ -200,8 +200,16 @@ def build_append_audio_command(
     remove_source_stream: bool,
     remove_streams: Sequence[int] = (),
     removed_other_audio: int = 0,
+    make_default: Optional[bool] = None,
+    title: Optional[str] = None,
+    keep_args: Sequence[str] = (),
 ) -> List[str]:
-    """FFmpeg command for the AC-3 / E-AC-3 append workflow."""
+    """FFmpeg command for the AC-3 / E-AC-3 append workflow.
+
+    ``make_default`` None keeps the original behaviour (dispositions copied
+    from the source track). True makes the new track the only default audio
+    track; False clears its default flag so the original stays the choice.
+    """
     converted_audio_index = converted_audio_output_index(
         audio_stream_count, remove_source_stream, removed_other_audio)
     cmd = [ffmpeg_path, "-hide_banner", "-nostdin", "-i", source_path]
@@ -210,11 +218,29 @@ def build_append_audio_command(
         "-c", "copy",
         f"-c:a:{converted_audio_index}", codec,
         f"-b:a:{converted_audio_index}", bitrate,
+    ]
+    if title:
+        cmd += [f"-metadata:s:a:{converted_audio_index}", f"title={title}"]
+    if make_default is not None:
+        cmd += disposition_args(converted_audio_index, make_default) + ["-default_mode", "passthrough"]
+    else:
+        cmd += list(keep_args)
+    cmd += [
         "-progress", "pipe:1", "-nostats",
         "-y",
         output_path,
     ]
     return cmd
+
+
+def disposition_args(audio_index: int, make_default: bool) -> List[str]:
+    """Make output audio ``audio_index`` the only default track, or clear its flag."""
+    if not make_default:
+        return [f"-disposition:a:{audio_index}", "0"]
+    args = []
+    for j in range(audio_index):
+        args += [f"-disposition:a:{j}", "-default"]
+    return args + [f"-disposition:a:{audio_index}", "default"]
 
 
 # --------------------------------------------------------------------------
@@ -392,6 +418,9 @@ def convert_and_append_audio(
     remove_streams: Sequence[int] = (),
     removed_other_audio: int = 0,
     on_progress: Optional[Callable[[FFmpegProgress], None]] = None,
+    make_default: Optional[bool] = None,
+    validate: Optional[Callable[[str], None]] = None,
+    title: Optional[str] = None,
 ) -> bool:
     """
     Append a converted audio stream to an MKV, then safely replace that MKV.
@@ -413,6 +442,9 @@ def convert_and_append_audio(
         handle: Optional ProcessHandle used to cancel the conversion
         remove_streams: Other absolute stream indices (audio/subtitle) to drop
         removed_other_audio: How many of ``remove_streams`` are audio streams
+        make_default: see build_append_audio_command
+        validate: optional check of the finished temporary file; raising
+            stops the replace (the source is left unchanged)
 
     Returns:
         True on success, False on failure
@@ -420,23 +452,102 @@ def convert_and_append_audio(
     if audio_stream_count < 1:
         raise RuntimeError("The MKV does not contain an audio stream to convert")
 
+    removed = set(remove_streams) | ({source_stream_index} if remove_source_stream else set())
+    keep = keep_dispositions_args(_probe_quietly(input_path, ffmpeg_path), removed)
     cmd_args = (source_stream_index, audio_stream_count, codec, bitrate,
-                remove_source_stream, remove_streams, removed_other_audio)
+                remove_source_stream, remove_streams, removed_other_audio, make_default, title, keep)
     return _rewrite_in_place(
         input_path, ffmpeg_path,
         lambda src, tmp: build_append_audio_command(ffmpeg_path, src, tmp, *cmd_args),
-        progress_callback, handle, encoding=True, on_progress=on_progress,
+        progress_callback, handle, encoding=True, on_progress=on_progress, validate=validate,
     )
 
 
 def build_remove_streams_command(ffmpeg_path: str, source_path: str, output_path: str,
-                                 remove_streams: Sequence[int]) -> List[str]:
-    """Stream-copy every track except ``remove_streams`` (nothing is re-encoded)."""
+                                 remove_streams: Sequence[int], keep_args: Sequence[str] = ()) -> List[str]:
+    """Stream-copy every track except ``remove_streams`` (nothing is re-encoded).
+
+    ``keep_args`` (see keep_dispositions_args) keeps default flags unchanged.
+    """
     cmd = [ffmpeg_path, "-hide_banner", "-nostdin", "-i", source_path, "-map", "0"]
     for index in sorted(set(remove_streams)):
         cmd += ["-map", f"-0:{index}"]
-    cmd += ["-c", "copy", "-progress", "pipe:1", "-nostats", "-y", output_path]
+    cmd += ["-c", "copy"] + list(keep_args) + ["-progress", "pipe:1", "-nostats", "-y", output_path]
     return cmd
+
+
+DISPOSITION_NAMES = (
+    "default", "dub", "original", "comment", "lyrics", "karaoke", "forced", "hearing_impaired",
+    "visual_impaired", "clean_effects", "attached_pic", "captions", "descriptions", "metadata",
+    "dependent", "still_image",
+)
+
+
+def keep_dispositions_args(probe: Optional[dict], removed: Sequence[int] = ()) -> List[str]:
+    """Stop the ffmpeg CLI from inventing default flags.
+
+    When no ``-disposition`` option is given, ffmpeg marks the first track of
+    a type "default" if two or more tracks of that type remain and none is
+    default - e.g. the first subtitle after removing others, which makes
+    players show subtitles automatically. Any explicit disposition disables
+    that, so output stream 0 is given exactly the flags it already has.
+    """
+    removed = set(removed)
+    for st in (probe or {}).get("streams", []):
+        if st.get("index") in removed or st.get("codec_type") in ("attachment", None):
+            continue
+        flags = [k for k, v in (st.get("disposition") or {}).items() if v and k in DISPOSITION_NAMES]
+        return ["-disposition:0", "+".join(flags) or "0"]
+    return []
+
+
+def _probe_quietly(source_path: str, ffmpeg_path: str) -> Optional[dict]:
+    try:
+        ffprobe = find_ffprobe(ffmpeg_path)
+        return run_ffprobe(ffprobe, source_path) if ffprobe else None
+    except Exception:
+        return None
+
+
+def build_remux_command(ffmpeg_path: str, source_path: str, output_path: str,
+                        remove_streams: Sequence[int] = (),
+                        dispositions: Optional[dict] = None,
+                        keep_args: Sequence[str] = ()) -> List[str]:
+    """Stream-copy remux that can drop tracks and set dispositions.
+
+    ``dispositions`` maps an OUTPUT stream specifier (e.g. "a:0") to an
+    FFmpeg disposition value ("default", "0", "-default", ...). Default flags
+    are written exactly as set (``-default_mode passthrough``).
+    """
+    cmd = [ffmpeg_path, "-hide_banner", "-nostdin", "-i", source_path, "-map", "0"]
+    for index in sorted(set(remove_streams)):
+        cmd += ["-map", f"-0:{index}"]
+    cmd += ["-c", "copy"] + list(keep_args)
+    for spec, value in (dispositions or {}).items():
+        cmd += [f"-disposition:{spec}", value]
+    cmd += ["-default_mode", "passthrough", "-progress", "pipe:1", "-nostats", "-y", output_path]
+    return cmd
+
+
+def remux_in_place(
+    input_path: str,
+    ffmpeg_path: str,
+    remove_streams: Sequence[int] = (),
+    dispositions: Optional[dict] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+    handle: Optional[ProcessHandle] = None,
+    on_progress: Optional[Callable[[FFmpegProgress], None]] = None,
+    validate: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Library-scanner repair: drop tracks and/or fix flags without re-encoding."""
+    if not remove_streams and not dispositions:
+        raise RuntimeError("Nothing to change")
+    keep = keep_dispositions_args(_probe_quietly(input_path, ffmpeg_path), remove_streams)
+    return _rewrite_in_place(
+        input_path, ffmpeg_path,
+        lambda src, tmp: build_remux_command(ffmpeg_path, src, tmp, remove_streams, dispositions, keep),
+        progress_callback, handle, encoding=False, on_progress=on_progress, validate=validate,
+    )
 
 
 def remove_streams_in_place(
@@ -454,9 +565,10 @@ def remove_streams_in_place(
     """
     if not remove_streams:
         raise RuntimeError("No tracks were chosen for removal")
+    keep = keep_dispositions_args(_probe_quietly(input_path, ffmpeg_path), remove_streams)
     return _rewrite_in_place(
         input_path, ffmpeg_path,
-        lambda src, tmp: build_remove_streams_command(ffmpeg_path, src, tmp, remove_streams),
+        lambda src, tmp: build_remove_streams_command(ffmpeg_path, src, tmp, remove_streams, keep),
         progress_callback, handle, encoding=False, on_progress=on_progress,
     )
 
@@ -488,8 +600,12 @@ def _rewrite_in_place(
     handle: Optional[ProcessHandle],
     encoding: bool,
     on_progress: Optional[Callable[[FFmpegProgress], None]] = None,
+    validate: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """Run ``build_cmd(source, temp)`` then atomically replace the source.
+
+    ``validate(temp_path)`` (optional) runs before the replace; if it raises,
+    the temporary file is deleted and the source is left unchanged.
 
     Even without re-encoding, MKV interleaves every track, so the whole file
     is read and written again; the time is set by the disk. ``on_progress``
@@ -538,6 +654,11 @@ def _rewrite_in_place(
             raise RuntimeError("FFmpeg produced an empty file; the source was not changed")
         if progress_callback:
             progress_callback(copy_summary(written, time.monotonic() - started))
+
+        if validate is not None:
+            if progress_callback:
+                progress_callback("Validating the new file before replacing the original...")
+            validate(temporary_path)
 
         os.replace(temporary_path, source_path)
         if progress_callback:
