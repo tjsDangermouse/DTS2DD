@@ -2,6 +2,7 @@
 import array
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -449,6 +450,26 @@ class TrackRemovalCommandTests(unittest.TestCase):
         self.assertEqual([(s.stream_index, s.language, s.is_forced) for s in subs],
                          [(3, "eng", True), (4, None, False)])
         self.assertEqual(str(subs[0]), "PGS [eng] {default, forced}")
+
+
+class ProgressParsingTests(unittest.TestCase):
+    """Removal / AC-3 jobs report percentage and bytes written."""
+
+    def test_progress_reports_fraction_and_bytes(self):
+        script = ("import sys\n"
+                  "for t, b in ((30, 1000000), (60, 2500000)):\n"
+                  "    print(f'out_time_us={t * 1000000}'); print(f'total_size={b}')\n"
+                  "    print('speed=2.0x'); print('progress=continue')\n")
+        seen = []
+        result = ffmpeg_helper.run_ffmpeg([sys.executable, "-c", script], total_seconds=120,
+                                          on_progress=seen.append)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual([(p.fraction, p.out_bytes, p.speed) for p in seen],
+                         [(0.25, 1000000, 2.0), (0.5, 2500000, 2.0)])
+
+    def test_copy_summary(self):
+        self.assertEqual(ffmpeg_helper.copy_summary(40_100_000_000, 845),
+                         "Wrote 40.1 GB in 14:05 (47 MB/s)")
 
 
 class FileSafetyTests(unittest.TestCase):

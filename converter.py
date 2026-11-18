@@ -14,7 +14,7 @@ from ffmpeg_downloader import ensure_ffmpeg_available, get_ffmpeg_path
 from ffmpeg_helper import (
     ConversionCancelled, ProcessHandle, convert_and_append_audio, get_tracks, remove_streams_in_place,
 )
-from media_probe import find_ffprobe, parse_timecode
+from media_probe import find_ffprobe, format_seconds, parse_timecode
 from truehd_encoder import (
     LAYOUT_LABELS, STATUS_MISSING, STATUS_NO_71, STATUS_NOT_VERIFIED, STATUS_READY,
     TrueHDError, check_encoder, create_channel_test_file,
@@ -152,8 +152,13 @@ class ConverterApp:
         tracks.pack(fill=BOTH, expand=True, pady=(0, 10))
         audio_frame = LabelFrame(tracks, text="Audio Streams (click a row to tick ☑ for removal)",
                                  padx=6, pady=2)
-        subs_frame = LabelFrame(tracks, text="Subtitle Tracks (click to tick ☑ for removal)",
-                                padx=6, pady=2)
+        # The "tick all" checkbox IS the frame title, so it costs no height.
+        self.subs_all_var = BooleanVar(value=False)
+        self.subs_all_check = Checkbutton(
+            tracks, text="Subtitle Tracks - tick all for removal",
+            variable=self.subs_all_var, command=self._toggle_all_subtitles, state="disabled",
+            pady=0, bd=0, highlightthickness=0)
+        subs_frame = LabelFrame(tracks, labelwidget=self.subs_all_check, padx=6, pady=2)
         tracks.add(audio_frame, weight=3)
         tracks.add(subs_frame, weight=2)
         self.audio_tree = self._make_track_tree(audio_frame)
@@ -323,11 +328,46 @@ class ConverterApp:
         return ([s for s in self.audio_streams if s.stream_index in self.remove_ticks],
                 [s for s in self.subtitle_streams if s.stream_index in self.remove_ticks])
 
-    @staticmethod
-    def _describe_tracks(audio, subtitles):
-        return "\n".join([f"  • Audio #{s.stream_index}: {s}".replace(f"Stream #{s.stream_index}: ", "")
-                          for s in audio] +
-                         [f"  • Subtitle #{s.stream_index}: {s}" for s in subtitles])
+    def _toggle_all_subtitles(self):
+        """Tick or untick every subtitle track."""
+        if self.busy:
+            return
+        indices = {s.stream_index for s in self.subtitle_streams}
+        if self.subs_all_var.get():
+            self.remove_ticks |= indices
+        else:
+            self.remove_ticks -= indices
+        for index in indices:
+            self._render_track_row(self.subs_tree, index)
+        self._refresh_convert_state()
+
+    MAX_LISTED_TRACKS = 8
+
+    def _describe_tracks(self, audio, subtitles):
+        """Bullet list for confirmation dialogs (films can have 40+ subtitles)."""
+        lines = [f"  • Audio #{s.stream_index}: {s}".replace(f"Stream #{s.stream_index}: ", "")
+                 for s in audio]
+        if subtitles and len(subtitles) == len(self.subtitle_streams) and len(subtitles) > 1:
+            lines.append(f"  • All {len(subtitles)} subtitle tracks")
+        else:
+            lines += [f"  • Subtitle #{s.stream_index}: {s}" for s in subtitles]
+        if len(lines) > self.MAX_LISTED_TRACKS:
+            hidden = len(lines) - (self.MAX_LISTED_TRACKS - 1)
+            lines = lines[:self.MAX_LISTED_TRACKS - 1] + [f"  ... and {hidden} more tracks"]
+        return "\n".join(lines)
+
+    def _progress_reporter(self, phase):
+        """on_progress callback for run_ffmpeg: % done, speed, time left, disk rate."""
+        def report(p):
+            detail = f"{format_seconds(p.elapsed)} elapsed"
+            if p.speed:
+                detail += f" • {p.speed:.1f}x"
+            if p.eta is not None:
+                detail += f" • ~{format_seconds(p.eta)} remaining"
+            if p.write_rate:
+                detail += f" • {p.write_rate / 1e6:.0f} MB/s"
+            self._ui(self._show_progress, phase, p.fraction, detail)
+        return report
 
     def _create_truehd_panel(self, parent):
         """TrueHD-only settings (shown when Dolby TrueHD is selected)."""
@@ -510,6 +550,9 @@ class ConverterApp:
         audio, subtitles = self._ticked()
         count = len(audio) + len(subtitles)
         self.remove_tracks_button.config(state="normal" if count and not self.busy else "disabled")
+        subs = self.subtitle_streams
+        self.subs_all_var.set(bool(subs) and len(subtitles) == len(subs))
+        self.subs_all_check.config(state="normal" if subs and not self.busy else "disabled")
         if count:
             parts = []
             if audio:
@@ -814,6 +857,7 @@ class ConverterApp:
                     handle=handle,
                     remove_streams=remove_streams,
                     removed_other_audio=len(other_audio),
+                    on_progress=self._progress_reporter("Converting"),
                 )
 
                 if result:
@@ -871,7 +915,8 @@ class ConverterApp:
         def worker():
             try:
                 remove_streams_in_place(input_path, self.ffmpeg_path, indices,
-                                        progress_callback=self._log, handle=handle)
+                                        progress_callback=self._log, handle=handle,
+                                        on_progress=self._progress_reporter("Removing tracks"))
                 self._log(f"✓ Removed {len(indices)} track(s)")
                 self._log("========================================")
                 self._ui(messagebox.showinfo, "Tracks removed",

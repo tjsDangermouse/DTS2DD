@@ -153,7 +153,7 @@ ffmpeg -i input.mkv -c:v copy -c:a eac3 -b:a 640k output.mkv -y
 
 ## Known Limitations & Workarounds
 
-1. **Progress Percentage**: TrueHD shows percentage/speed/ETA from `run_ffmpeg()`. The AC-3/E-AC-3 path still shows an indeterminate bar (it does not pass a duration).
+1. **Progress / speed of in-place jobs**: all jobs show percentage/speed/ETA from `run_ffmpeg()`; `_rewrite_in_place()` (AC-3/E-AC-3 and track removal) probes the duration and also shows MB/s written. Track removal is still a full rewrite (MKV interleaves tracks), so a 40 GB film on a USB/HDD takes many minutes - disk-bound, not CPU-bound.
 
 2. **Nested FFmpeg Directories**: Windows ZIP extraction creates nested folders. Handled by `rglob()` search in `get_ffmpeg_path()`.
 

@@ -84,6 +84,11 @@ Audio and subtitle tracks are listed side by side. Click a row to tick it
 - **Remove Ticked Tracks** removes them on their own - nothing is converted,
   every other track is copied unchanged and the MKV is updated in place
   after you confirm.
+- Tick the **Subtitle Tracks - tick all** box in the subtitle list's title to
+  tick every subtitle track at once (handy for films with 40+ subtitles).
+- Removal is not instant: MKV interleaves all tracks, so the whole file is
+  copied. Speed depends on the disk - a 40 GB film on a USB hard drive can
+  take 15+ minutes. The progress bar shows the percentage, time left and MB/s.
 - **Convert** also leaves the ticked tracks out (AC-3/E-AC-3 update the MKV;
   TrueHD leaves them out of the new file and verifies they are gone and
   everything else is intact).

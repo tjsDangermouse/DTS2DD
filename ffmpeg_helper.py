@@ -12,8 +12,8 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 from audio_stream_info import AudioStreamInfo, SubtitleStreamInfo
 from media_probe import (
-    audio_streams_from_probe, find_ffprobe, run_ffprobe, subprocess_flags,
-    subtitle_streams_from_probe,
+    audio_streams_from_probe, find_ffprobe, format_duration, format_seconds, run_ffprobe,
+    subprocess_flags, subtitle_streams_from_probe,
 )
 
 
@@ -227,6 +227,14 @@ class FFmpegProgress:
     total_seconds: Optional[float]
     speed: Optional[float]
     elapsed: float
+    out_bytes: Optional[int] = None    # bytes written so far (stream copy: disk-bound)
+
+    @property
+    def write_rate(self) -> Optional[float]:
+        """Average bytes per second written so far."""
+        if not self.out_bytes or self.elapsed <= 0:
+            return None
+        return self.out_bytes / self.elapsed
 
     @property
     def fraction(self) -> Optional[float]:
@@ -329,6 +337,7 @@ def run_ffmpeg(
     stderr_thread.start()
 
     out_seconds = 0.0
+    out_bytes = None
     speed = None
     try:
         for line in proc.stdout:
@@ -339,6 +348,11 @@ def run_ffmpeg(
                     out_seconds = int(value) / 1_000_000
                 except ValueError:
                     pass
+            elif key == "total_size":
+                try:
+                    out_bytes = int(value)
+                except ValueError:
+                    pass
             elif key == "speed":
                 try:
                     speed = float(value.rstrip("x"))
@@ -346,7 +360,7 @@ def run_ffmpeg(
                     speed = None
             elif key == "progress" and on_progress:
                 on_progress(FFmpegProgress(out_seconds, total_seconds, speed,
-                                           time.monotonic() - started))
+                                           time.monotonic() - started, out_bytes))
         proc.wait()
     finally:
         if proc.poll() is None:
@@ -377,6 +391,7 @@ def convert_and_append_audio(
     handle: Optional[ProcessHandle] = None,
     remove_streams: Sequence[int] = (),
     removed_other_audio: int = 0,
+    on_progress: Optional[Callable[[FFmpegProgress], None]] = None,
 ) -> bool:
     """
     Append a converted audio stream to an MKV, then safely replace that MKV.
@@ -410,7 +425,7 @@ def convert_and_append_audio(
     return _rewrite_in_place(
         input_path, ffmpeg_path,
         lambda src, tmp: build_append_audio_command(ffmpeg_path, src, tmp, *cmd_args),
-        progress_callback, handle, encoding=True,
+        progress_callback, handle, encoding=True, on_progress=on_progress,
     )
 
 
@@ -430,6 +445,7 @@ def remove_streams_in_place(
     remove_streams: Sequence[int],
     progress_callback: Optional[Callable[[str], None]] = None,
     handle: Optional[ProcessHandle] = None,
+    on_progress: Optional[Callable[[FFmpegProgress], None]] = None,
 ) -> bool:
     """Remove audio/subtitle tracks from an MKV without converting anything.
 
@@ -441,8 +457,27 @@ def remove_streams_in_place(
     return _rewrite_in_place(
         input_path, ffmpeg_path,
         lambda src, tmp: build_remove_streams_command(ffmpeg_path, src, tmp, remove_streams),
-        progress_callback, handle, encoding=False,
+        progress_callback, handle, encoding=False, on_progress=on_progress,
     )
+
+
+def _duration_of(source_path: str, ffmpeg_path: str) -> Optional[float]:
+    """Film length for the progress bar (None = bar stays indeterminate)."""
+    try:
+        ffprobe = find_ffprobe(ffmpeg_path)
+        return format_duration(run_ffprobe(ffprobe, source_path)) if ffprobe else None
+    except Exception:
+        return None
+
+
+def format_size(size: float) -> str:
+    return f"{size / 1e9:.1f} GB" if size >= 1e9 else f"{size / 1e6:.0f} MB"
+
+
+def copy_summary(written: int, seconds: float) -> str:
+    """E.g. 'Wrote 40.1 GB in 14:05 (47 MB/s)'."""
+    rate = f" ({written / seconds / 1e6:.0f} MB/s)" if seconds > 0 else ""
+    return f"Wrote {format_size(written)} in {format_seconds(seconds)}{rate}"
 
 
 def _rewrite_in_place(
@@ -452,8 +487,14 @@ def _rewrite_in_place(
     progress_callback: Optional[Callable[[str], None]],
     handle: Optional[ProcessHandle],
     encoding: bool,
+    on_progress: Optional[Callable[[FFmpegProgress], None]] = None,
 ) -> bool:
-    """Run ``build_cmd(source, temp)`` then atomically replace the source."""
+    """Run ``build_cmd(source, temp)`` then atomically replace the source.
+
+    Even without re-encoding, MKV interleaves every track, so the whole file
+    is read and written again; the time is set by the disk. ``on_progress``
+    receives percentage / speed / bytes written so the user can see that.
+    """
     source_path = os.path.abspath(input_path)
     source_dir = os.path.dirname(source_path)
     source_name = os.path.basename(source_path)
@@ -477,7 +518,9 @@ def _rewrite_in_place(
             progress_callback("Creating a temporary MKV before replacing the source file...")
             progress_callback("Encoding in progress..." if encoding else "Copying tracks...")
 
-        result = run_ffmpeg(cmd, handle=handle)
+        total_seconds = _duration_of(source_path, ffmpeg_path)
+        started = time.monotonic()
+        result = run_ffmpeg(cmd, total_seconds=total_seconds, on_progress=on_progress, handle=handle)
         returncode = result.returncode
 
         if progress_callback:
@@ -490,8 +533,11 @@ def _rewrite_in_place(
                 f"FFmpeg {'conversion' if encoding else 'track removal'} failed with code {returncode}:\n{result.error_summary()}"
             )
 
-        if os.path.getsize(temporary_path) == 0:
+        written = os.path.getsize(temporary_path)
+        if written == 0:
             raise RuntimeError("FFmpeg produced an empty file; the source was not changed")
+        if progress_callback:
+            progress_callback(copy_summary(written, time.monotonic() - started))
 
         os.replace(temporary_path, source_path)
         if progress_callback:
