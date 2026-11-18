@@ -9,6 +9,7 @@ import json
 import platform
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -283,36 +284,22 @@ def video_packet_hashes(
     return hashes
 
 
-def stream_packet_hashes(
-    ffmpeg_path: str,
-    file_path: str,
-    stream_indices: Sequence[int],
-    seconds: float,
-    seek: Optional[float] = None,
-    timeout: int = 1800,
-) -> Dict[int, List[Tuple[str, str, float]]]:
-    """(size, md5, dts seconds) of every packet of the given streams within a time window.
+# Packets are interleaved within a few seconds in a Matroska file (FFmpeg's
+# default max_interleave_delta is 10 s), so once the read is this far past the
+# window every packet inside the window has been delivered.
+PACKET_WINDOW_MARGIN = 20.0
 
-    One pass with stream copy, so payloads are hashed exactly as the demuxer
-    delivers them (after Matroska content decoding such as zlib). Returns a
-    dict keyed by the requested stream index.
-    """
-    cmd = [ffmpeg_path, "-hide_banner", "-nostdin", "-v", "error"]
-    if seek is not None:
-        cmd += ["-ss", f"{seek:.6f}"]
-    cmd += ["-t", f"{seconds:.3f}", "-i", file_path]
-    for index in stream_indices:
-        cmd += ["-map", f"0:{index}"]
-    cmd += ["-c", "copy", "-f", "framemd5", "-"]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=timeout, creationflags=subprocess_flags(),
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Could not read packets: {result.stderr.strip()[-300:]}")
+
+def parse_packet_hashes(lines, stream_indices: Sequence[int], window: Optional[float] = None,
+                        margin: float = PACKET_WINDOW_MARGIN) -> Dict[int, List[Tuple[str, str, float]]]:
+    """Parse framemd5 lines. With ``window``, keep packets up to ``window``
+    seconds after the first one and stop consuming ``lines`` once a packet is
+    ``margin`` seconds beyond that."""
     hashes: Dict[int, List[Tuple[str, str, float]]] = {index: [] for index in stream_indices}
     time_bases: Dict[int, float] = {}
-    for line in result.stdout.splitlines():
+    first = None
+    for line in lines:
+        line = line.rstrip("\r\n")
         if line.startswith("#tb "):                     # "#tb 0: 1/1000"
             key, _, value = line[4:].partition(":")
             num, _, den = value.strip().partition("/")
@@ -330,7 +317,72 @@ def stream_packet_hashes(
                 dts = int(fields[1]) * time_bases.get(k, 0.0)
             except ValueError:
                 dts = 0.0
+            first = dts if first is None else min(first, dts)
+            if window is not None and dts - first > window:
+                if dts - first > window + margin:
+                    break
+                continue
             hashes[stream_indices[k]].append((fields[4], fields[5], dts))
+    return hashes
+
+
+def stream_packet_hashes(
+    ffmpeg_path: str,
+    file_path: str,
+    stream_indices: Sequence[int],
+    seconds: float,
+    seek: Optional[float] = None,
+    timeout: int = 1800,
+) -> Dict[int, List[Tuple[str, str, float]]]:
+    """(size, md5, dts seconds) of every packet of the given streams within a time window.
+
+    One pass with stream copy, so payloads are hashed exactly as the demuxer
+    delivers them (after Matroska content decoding such as zlib). Returns a
+    dict keyed by the requested stream index.
+
+    FFmpeg's input ``-t`` ends each stream separately: a subtitle track with
+    no event after the window never ends, and FFmpeg then reads the whole
+    film (an hour on a USB hard disk). So no ``-t`` is given: the output is
+    read as it arrives, packets after the window are ignored, and FFmpeg is
+    stopped once the read is PACKET_WINDOW_MARGIN past the window - only the
+    start of the file is ever read.
+    """
+    cmd = [ffmpeg_path, "-hide_banner", "-nostdin", "-v", "error"]
+    if seek is not None:
+        cmd += ["-ss", f"{seek:.6f}"]
+    cmd += ["-i", file_path]
+    for index in stream_indices:
+        cmd += ["-map", f"0:{index}"]
+    cmd += ["-c", "copy", "-f", "framemd5", "-"]
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", creationflags=subprocess_flags())
+    stderr: List[str] = []
+    drain = threading.Thread(target=lambda: stderr.extend(proc.stderr), daemon=True)
+    drain.start()
+    timed_out = threading.Event()
+
+    def on_timeout():
+        timed_out.set()
+        proc.kill()
+    timer = threading.Timer(timeout, on_timeout)
+    timer.start()
+    stopped_early = False
+    try:
+        hashes = parse_packet_hashes(proc.stdout, stream_indices, seconds)
+        if proc.poll() is None:
+            stopped_early = True       # window passed: no need to read the rest of the film
+            proc.kill()
+        proc.wait()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        drain.join(timeout=5)
+    if timed_out.is_set():
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    if not stopped_early and proc.returncode != 0:
+        raise RuntimeError(f"Could not read packets: {''.join(stderr).strip()[-300:]}")
     return hashes
 
 

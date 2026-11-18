@@ -603,3 +603,27 @@ class SettingsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PacketWindowTests(unittest.TestCase):
+    """The copied-track check must not read the whole film when a subtitle track is sparse."""
+
+    def test_stops_consuming_after_window(self):
+        from media_probe import parse_packet_hashes
+        lines = ["#tb 0: 1/1000", "#tb 1: 1/1000", "1,     1000,     1000,  500,   12, aaaa"]
+        lines += [f"0, {t * 1000}, {t * 1000}, 41, 100, h{t}" for t in range(0, 2000)]
+        consumed = []
+
+        def feed():
+            for line in lines:
+                consumed.append(line)
+                yield line
+        hashes = parse_packet_hashes(feed(), [5, 7], window=300, margin=20)
+        self.assertEqual(len(hashes[5]), 301)                 # 0 .. 300 s
+        self.assertEqual(hashes[7], [("12", "aaaa", 1.0)])
+        self.assertLess(len(consumed), 330)                   # stopped at ~320 s, not at 2000 s
+
+    def test_no_window_reads_everything(self):
+        from media_probe import parse_packet_hashes
+        lines = ["#tb 0: 1/1"] + [f"0, {t}, {t}, 1, 1, x" for t in range(50)]
+        self.assertEqual(len(parse_packet_hashes(lines, [0])[0]), 50)
